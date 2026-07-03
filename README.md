@@ -1,21 +1,9 @@
-# SCAMP — Zebrafish Spine Straightener & Heatmap
+# SCAMP — Spinal Calcification & Mineralization Profiler
 
-SCAMP is a single-file, napari-style GUI for analysing Alizarin Red S–stained zebrafish spinal mineralization.
+SCAMP is a single-file, napari-style GUI for analysing Alizarin Red S–stained fish spinal mineralization.
 
-It now covers the complete workflow from raw CZI stacks to background-subtracted projections, straightened spine images, quality-control reports, cohort heatmaps, and output tables.
+It covers the complete workflow from raw CZI stacks to background-subtracted projections, straightened spine images, quality-control reports, cohort heatmaps, and output tables.
 
----
-
-## What SCAMP replaces
-
-| Previous script | Previous role | Current SCAMP role |
-|---|---|---|
-| `norm_mean_IP.py` | CZI + ROI background subtraction and projection | `Subtract background` |
-| `interactive_straighten2.py` | manual guide placement and straightening | `Add straighten guides` + `Straighten current` |
-| `gerinc_illesztes_batch_heatmap.py` | profile extraction, heatmap, tables | `Process all - heatmap + tables` |
-| `warp.py` | straightening helper | replaced by SCAMP ribbon straightening |
-
----
 
 ## Install
 
