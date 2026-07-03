@@ -1,0 +1,7 @@
+"metric_id";"metric";"term";"Df";"Sum Sq";"Mean Sq";"F value";"Pr(>F)";"p_value";"p_value_formatted";"significance"
+"integrated_fluorescence";"Total mineralization burden";"group      ";1;63384857355,8721;63384857355,8721;6,5468584367454;0,0179074598587991;0,0179074598587991;"1.791e-02";"*"
+"integrated_fluorescence";"Total mineralization burden";"Residuals  ";22;212997863830,764;9681721083,21655;NA;NA;NA;NA;"n.c."
+"positive_area";"Extent of spinal mineralization";"group      ";1;4220,16171428571;4220,16171428571;31,4446967484523;1,2267671462562e-05;1,2267671462562e-05;"1.227e-05";"****"
+"positive_area";"Extent of spinal mineralization";"Residuals  ";22;2952,59828571429;134,209012987013;NA;NA;NA;NA;"n.c."
+"mean_positive_fluorescence";"Mineralization density";"group      ";1;1835,84545685677;1835,84545685677;0,136380071501645;0,715437218686918;0,715437218686918;"7.154e-01";"ns"
+"mean_positive_fluorescence";"Mineralization density";"Residuals  ";22;296147,37407116;13461,2442759618;NA;NA;NA;NA;"n.c."

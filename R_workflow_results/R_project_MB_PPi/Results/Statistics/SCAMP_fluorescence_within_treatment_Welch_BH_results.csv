@@ -1,0 +1,25 @@
+"metric_id";"metric";"treatment";"p_raw";"p_adj_BH";"p_label";"p_raw_formatted";"p_adj_BH_formatted";"treatment_x";"x";"xend"
+"integrated_fluorescence";"Integrated fluorescence";"-MB
+-PPi";0,00348247876838084;0,00464330502450778;"**";"3.482e-03";"4.643e-03";1;0,82;1,18
+"integrated_fluorescence";"Integrated fluorescence";"+MB
+-PPi";7,13767327951345e-09;2,85506931180538e-08;"****";"7.138e-09";"2.855e-08";2;1,82;2,18
+"integrated_fluorescence";"Integrated fluorescence";"-MB
++PPi";0,824028929808407;0,824028929808407;"ns";"8.240e-01";"8.240e-01";3;2,82;3,18
+"integrated_fluorescence";"Integrated fluorescence";"+MB
++PPi";0,000496072302329181;0,000992144604658361;"***";"4.961e-04";"9.921e-04";4;3,82;4,18
+"positive_area";"Extent of spinal mineralization";"-MB
+-PPi";0,00178769705947225;0,00238359607929634;"**";"1.788e-03";"2.384e-03";1;0,82;1,18
+"positive_area";"Extent of spinal mineralization";"+MB
+-PPi";1,7075528724554e-10;6,83021148982159e-10;"****";"1.708e-10";"6.830e-10";2;1,82;2,18
+"positive_area";"Extent of spinal mineralization";"-MB
++PPi";0,738730569818971;0,738730569818971;"ns";"7.387e-01";"7.387e-01";3;2,82;3,18
+"positive_area";"Extent of spinal mineralization";"+MB
++PPi";0,000651342858981954;0,00130268571796391;"**";"6.513e-04";"1.303e-03";4;3,82;4,18
+"mean_positive_fluorescence";"Mineralization density";"-MB
+-PPi";0,00651627761721703;0,00868837015628937;"**";"6.516e-03";"8.688e-03";1;0,82;1,18
+"mean_positive_fluorescence";"Mineralization density";"+MB
+-PPi";8,70475613087747e-09;3,48190245235099e-08;"****";"8.705e-09";"3.482e-08";2;1,82;2,18
+"mean_positive_fluorescence";"Mineralization density";"-MB
++PPi";0,102863809307815;0,102863809307815;"ns";"1.029e-01";"1.029e-01";3;2,82;3,18
+"mean_positive_fluorescence";"Mineralization density";"+MB
++PPi";0,00297241833966255;0,00594483667932511;"**";"2.972e-03";"5.945e-03";4;3,82;4,18

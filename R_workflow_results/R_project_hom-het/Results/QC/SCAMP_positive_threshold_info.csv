@@ -1,0 +1,2 @@
+"threshold";"baseline";"noise_mad";"background_quantile";"multiplier";"method"
+100,321452560653;20,9178869156607;26,4678552149975;0,6;3;"low-tail median + multiplier*MAD"

@@ -1,0 +1,4 @@
+"metric_id";"metric";"comparison";"test";"p_raw";"p_adj_BH";"p_label";"p_raw_formatted";"p_adj_BH_formatted"
+"integrated_fluorescence";"Total mineralization burden";"abcc6a+/- vs abcc6a-/-";"Welch two-sample t-test";0,0423565076489065;0,0423565076489065;"*";"4.236e-02";"4.236e-02"
+"positive_area";"Extent of spinal mineralization";"abcc6a+/- vs abcc6a-/-";"Welch two-sample t-test";0,000145890435984789;0,000145890435984789;"***";"1.459e-04";"1.459e-04"
+"mean_positive_fluorescence";"Mineralization density";"abcc6a+/- vs abcc6a-/-";"Welch two-sample t-test";0,739304843530315;0,739304843530315;"ns";"7.393e-01";"7.393e-01"

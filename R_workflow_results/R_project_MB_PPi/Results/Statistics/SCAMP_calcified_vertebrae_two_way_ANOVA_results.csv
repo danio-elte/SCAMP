@@ -1,0 +1,5 @@
+"metric_id";"metric";"term";"Df";"Sum Sq";"Mean Sq";"F value";"Pr(>F)";"p_value";"p_value_formatted";"significance"
+"calcified_vertebrae_all";"Calcified vertebrae count";"genotype          ";1;63,9404356239876;63,9404356239876;11,6366479763062;0,000996463174466323;0,000996463174466323;"9.965e-04";"***"
+"calcified_vertebrae_all";"Calcified vertebrae count";"treatment         ";3;62,3157662222695;20,7719220740898;3,78032371235154;0,0134616823318832;0,0134616823318832;"1.346e-02";"*"
+"calcified_vertebrae_all";"Calcified vertebrae count";"genotype:treatment";3;52,3915786341316;17,4638595447105;3,17828278531796;0,0281887251149954;0,0281887251149954;"2.819e-02";"*"
+"calcified_vertebrae_all";"Calcified vertebrae count";"Residuals         ";84;461,558741258741;5,49474691974692;NA;NA;NA;NA;"n.c."

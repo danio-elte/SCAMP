@@ -1,0 +1,19 @@
+"metric_id";"metric";"genotype";"baseline";"comparison";"n_baseline";"n_comparison";"p_raw";"p_adj_BH";"p_label";"p_raw_formatted";"p_adj_BH_formatted"
+"calcified_vertebrae_all";"Calcified vertebrae count";"abcc6a+/-";"-MB
+-PPi";"+MB
+-PPi";11;10;0,0109885491051309;0,0329656473153928;"*";"1.099e-02";"3.297e-02"
+"calcified_vertebrae_all";"Calcified vertebrae count";"abcc6a-/-";"-MB
+-PPi";"+MB
+-PPi";11;13;0,193254609323872;0,289881913985808;"ns";"1.933e-01";"2.899e-01"
+"calcified_vertebrae_all";"Calcified vertebrae count";"abcc6a+/-";"-MB
+-PPi";"-MB
++PPi";11;8;0,0722309668187391;0,108346450228109;"ns";"7.223e-02";"1.083e-01"
+"calcified_vertebrae_all";"Calcified vertebrae count";"abcc6a-/-";"-MB
+-PPi";"-MB
++PPi";11;16;0,117938190460896;0,289881913985808;"ns";"1.179e-01";"2.899e-01"
+"calcified_vertebrae_all";"Calcified vertebrae count";"abcc6a+/-";"-MB
+-PPi";"+MB
++PPi";11;10;0,14937803674743;0,14937803674743;"ns";"1.494e-01";"1.494e-01"
+"calcified_vertebrae_all";"Calcified vertebrae count";"abcc6a-/-";"-MB
+-PPi";"+MB
++PPi";11;13;0,401198843649307;0,401198843649307;"ns";"4.012e-01";"4.012e-01"

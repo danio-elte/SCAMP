@@ -1,0 +1,4 @@
+estimate,statistic,p.value,method,alternative,n,group,genotype,genotype_label,p_label
+0.27340823970037453,3.8163504586132793,1.3544009720056345e-4,Kendall's rank correlation tau,two.sided,90,all,NA,NA,***
+0.38670284938941657,4.626851895274215,3.712658064505365e-6,Kendall's rank correlation tau,two.sided,67,2_het,2_het,abcc6a+/-,****
+-0.1225296442687747,-0.8187241479347804,0.4129438160251831,Kendall's rank correlation tau,two.sided,23,3_mut,3_mut,abcc6a-/-,ns

@@ -1,0 +1,9 @@
+"metric_id";"metric";"treatment";"test";"p_raw";"p_adj_BH";"p_label";"p_raw_formatted";"p_adj_BH_formatted"
+"integrated_fluorescence";"Integrated fluorescence";"-MB
+-PPi";"Brown-Forsythe Levene test; center = median";0,00473232308060785;0,0189292923224314;"*";"4.732e-03";"1.893e-02"
+"integrated_fluorescence";"Integrated fluorescence";"+MB
+-PPi";"Brown-Forsythe Levene test; center = median";0,0503404837534673;0,100680967506935;"ns";"5.034e-02";"1.007e-01"
+"integrated_fluorescence";"Integrated fluorescence";"-MB
++PPi";"Brown-Forsythe Levene test; center = median";0,20897775728687;0,20897775728687;"ns";"2.090e-01";"2.090e-01"
+"integrated_fluorescence";"Integrated fluorescence";"+MB
++PPi";"Brown-Forsythe Levene test; center = median";0,206138806754047;0,20897775728687;"ns";"2.061e-01";"2.090e-01"

@@ -1,0 +1,1153 @@
+---
+title: "SCAMP MB/PPi mineralization analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## ================================================================
+## SCAMP MB/PPi mineralization analysis
+## ---------------------------------------------------------------
+## Inputs expected in the working directory by default:
+##   1) MB_PPi_data_combined.csv
+##      SCAMP pixel-profile matrix, semicolon-delimited.
+##      Expected fixed columns: fish/sample, treatment, replicate/other, genotype,
+##      followed by pixel columns.
+##
+##   2) superplota_method_allcalc_MB_PPi.csv
+##      Manual calcified-vertebrae quantification, semicolon-delimited.
+##      Expected columns: Genotype, Treatment, Calcified.vertebrae.all
+##
+## Outputs are written to Results/Figures and Results/Statistics.
+## ================================================================
+
+required_packages <- c(
+  "tidyverse",
+  "patchwork",
+  "knitr",
+  "car"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this notebook."
+  )
+}
+
+library(tidyverse)
+library(patchwork)
+library(knitr)
+library(car)
+
+## -----------------------------
+## User-editable input paths
+## -----------------------------
+
+scamp_data_path <- "MB_PPi_data_combined.csv"
+calcified_data_path <- "superplota_method_allcalc_MB_PPi.csv"
+
+output_dir <- "Results"
+figure_dir <- file.path(output_dir, "Figures")
+statistics_dir <- file.path(output_dir, "Statistics")
+qc_dir <- file.path(output_dir, "QC")
+
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(statistics_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+
+## -----------------------------
+## Plot settings
+## -----------------------------
+
+genotype_cols <- c(
+  "2_het" = "#261A68",
+  "3_mut" = "#B61515"
+)
+
+genotype_labels <- c(
+  "2_het" = "abcc6a+/-",
+  "3_mut" = "abcc6a-/-"
+)
+
+treatment_levels <- c(
+  "_-PPi_-MB",
+  "_-PPi_+MB",
+  "_+PPi_-MB",
+  "_+PPi_+MB"
+)
+
+treatment_labels <- c(
+  "-MB\n-PPi",
+  "+MB\n-PPi",
+  "-MB\n+PPi",
+  "+MB\n+PPi"
+)
+
+scamp_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(colour = "black"),
+    legend.title = element_blank()
+  )
+```
+
+# 1. Helper functions
+
+```{r helper-functions}
+## -----------------------------
+## Profile length normalization
+## -----------------------------
+
+normalize_row <- function(row, target_length = 1000) {
+  row <- as.numeric(row)
+  row <- row[is.finite(row)]
+
+  if (length(row) == 0) {
+    return(rep(NA_real_, target_length))
+  }
+
+  if (length(row) == 1) {
+    return(rep(row, target_length))
+  }
+
+  approx(
+    x = seq_along(row),
+    y = row,
+    xout = seq(1, length(row), length.out = target_length),
+    rule = 2
+  )$y
+}
+
+normalize_dataframe <- function(df, target_length = 1000, fixed_columns = 4) {
+  fixed_data <- df[, 1:fixed_columns, drop = FALSE]
+  variable_data <- df[, (fixed_columns + 1):ncol(df), drop = FALSE]
+
+  normalized_data <- variable_data %>%
+    apply(1, normalize_row, target_length = target_length) %>%
+    t() %>%
+    as.data.frame()
+
+  colnames(normalized_data) <- paste0("V", seq_len(target_length))
+
+  cbind(fixed_data, normalized_data)
+}
+
+## -----------------------------
+## Dataset-wide positive threshold
+## -----------------------------
+
+estimate_positive_threshold_low_tail <- function(pixel_matrix,
+                                                 background_quantile = 0.60,
+                                                 multiplier = 3) {
+  values <- as.numeric(pixel_matrix)
+  values <- values[is.finite(values)]
+  values <- values[values >= 0]
+
+  cutoff <- quantile(values, background_quantile, na.rm = TRUE)
+  bg_values <- values[values <= cutoff]
+
+  baseline <- median(bg_values, na.rm = TRUE)
+  noise_mad <- mad(bg_values, constant = 1.4826, na.rm = TRUE)
+
+  threshold <- baseline + multiplier * noise_mad
+
+  tibble(
+    threshold = threshold,
+    baseline = baseline,
+    noise_mad = noise_mad,
+    background_quantile = background_quantile,
+    multiplier = multiplier,
+    method = "low-tail median + multiplier*MAD"
+  )
+}
+
+## -----------------------------
+## P-value formatting
+## -----------------------------
+
+format_p_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "n.c.",
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+format_p_value <- function(p) {
+  ifelse(is.na(p), NA_character_, formatC(p, format = "e", digits = 3))
+}
+
+## -----------------------------
+## Robust statistical helpers
+## -----------------------------
+
+safe_welch_p <- function(data, value_col, group_col) {
+  x <- data[[value_col]]
+  g <- data[[group_col]]
+
+  if (length(unique(g[!is.na(g)])) < 2) return(NA_real_)
+
+  split_x <- split(x, g)
+
+  if (any(sapply(split_x, function(v) sum(!is.na(v)) < 2))) return(NA_real_)
+  if (sd(x, na.rm = TRUE) < .Machine$double.eps) return(NA_real_)
+
+  tryCatch(
+    t.test(x ~ g, var.equal = FALSE)$p.value,
+    error = function(e) NA_real_
+  )
+}
+
+safe_levene_p <- function(data, value_col, group_col) {
+  df <- data %>%
+    select(value = all_of(value_col), group = all_of(group_col)) %>%
+    filter(!is.na(value), !is.na(group)) %>%
+    mutate(group = droplevels(as.factor(group)))
+
+  if (n_distinct(df$group) < 2) return(NA_real_)
+  if (any(table(df$group) < 2)) return(NA_real_)
+  if (sd(df$value, na.rm = TRUE) < .Machine$double.eps) return(NA_real_)
+
+  tryCatch(
+    {
+      test <- car::leveneTest(value ~ group, data = df, center = median)
+      as.numeric(test[["Pr(>F)"]][1])
+    },
+    error = function(e) NA_real_
+  )
+}
+```
+
+# 2. Load and normalize SCAMP fluorescence profiles
+
+```{r load-scamp-data}
+if (!file.exists(scamp_data_path)) {
+  stop("SCAMP input file not found: ", scamp_data_path)
+}
+
+scamp_raw <- read.csv2(scamp_data_path, header = TRUE, check.names = FALSE)
+
+scamp_norm <- normalize_dataframe(
+  scamp_raw,
+  target_length = 1000,
+  fixed_columns = 4
+)
+
+pixel_data <- as.matrix(scamp_norm[, 5:ncol(scamp_norm)])
+storage.mode(pixel_data) <- "numeric"
+
+fish_info <- scamp_norm[[1]]
+treatment_info <- scamp_norm[[2]]
+genotype_info <- scamp_norm[[4]]
+
+threshold_info <- estimate_positive_threshold_low_tail(
+  pixel_data,
+  background_quantile = 0.60,
+  multiplier = 3
+)
+
+positive_threshold <- threshold_info$threshold[[1]]
+
+write.csv2(
+  threshold_info,
+  file.path(qc_dir, "SCAMP_positive_threshold_info.csv"),
+  row.names = FALSE
+)
+
+threshold_info
+```
+
+# 3. Build SCAMP biomarker table
+
+```{r metric-table}
+scamp_metric_df <- data.frame(
+  fish = fish_info,
+  treatment_raw = treatment_info,
+  genotype_raw = genotype_info,
+
+  integrated_fluorescence = rowSums(
+    pixel_data,
+    na.rm = TRUE
+  ),
+
+  positive_area = apply(
+    pixel_data,
+    1,
+    function(x) mean(x > positive_threshold, na.rm = TRUE) * 100
+  ),
+
+  mean_positive_fluorescence = apply(
+    pixel_data,
+    1,
+    function(x) {
+      positive_pixels <- x[x > positive_threshold]
+      if (length(positive_pixels) == 0) return(NA_real_)
+      mean(positive_pixels, na.rm = TRUE)
+    }
+  )
+) %>%
+  mutate(
+    genotype = factor(
+      genotype_raw,
+      levels = names(genotype_labels),
+      labels = genotype_labels
+    ),
+    treatment = factor(
+      treatment_raw,
+      levels = treatment_levels,
+      labels = treatment_labels
+    )
+  ) %>%
+  filter(!is.na(genotype), !is.na(treatment))
+
+write.csv2(
+  scamp_metric_df,
+  file.path(statistics_dir, "SCAMP_fluorescence_metrics_per_fish.csv"),
+  row.names = FALSE
+)
+
+kable(head(scamp_metric_df), caption = "SCAMP-derived fluorescence metrics")
+```
+
+# 4. Unified grouped analysis and plotting function
+
+```{r grouped-analysis-function}
+make_grouped_metric_analysis <- function(data,
+                                         metric,
+                                         y_label,
+                                         plot_title,
+                                         metric_id = NULL) {
+  metric <- rlang::ensym(metric)
+  metric_name <- rlang::as_string(metric)
+  if (is.null(metric_id)) metric_id <- metric_name
+
+  plot_df <- data %>%
+    filter(!is.na(.data[[metric_name]]))
+
+  ## Two-way ANOVA: genotype, treatment, and genotype:treatment interaction
+  anova_model <- aov(
+    as.formula(paste0(metric_name, " ~ genotype * treatment")),
+    data = plot_df
+  )
+
+  anova_table <- as.data.frame(summary(anova_model)[[1]]) %>%
+    tibble::rownames_to_column("term") %>%
+    mutate(
+      metric_id = metric_id,
+      metric = plot_title,
+      p_value = `Pr(>F)`,
+      p_value_formatted = format_p_value(p_value),
+      significance = format_p_stars(p_value)
+    ) %>%
+    select(metric_id, metric, term, everything())
+
+  ## Genotype comparisons within each treatment: Welch t-test + BH correction
+  welch_table <- plot_df %>%
+    group_by(treatment) %>%
+    summarise(
+      p_raw = safe_welch_p(
+        cur_data(),
+        value_col = metric_name,
+        group_col = "genotype"
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      metric_id = metric_id,
+      metric = plot_title,
+      p_adj_BH = p.adjust(p_raw, method = "BH"),
+      p_label = format_p_stars(p_adj_BH),
+      p_raw_formatted = format_p_value(p_raw),
+      p_adj_BH_formatted = format_p_value(p_adj_BH),
+      treatment_x = as.numeric(treatment),
+      x = treatment_x - 0.18,
+      xend = treatment_x + 0.18
+    ) %>%
+    select(metric_id, metric, treatment, p_raw, p_adj_BH, p_label, everything())
+
+  y_positions <- plot_df %>%
+    group_by(treatment) %>%
+    summarise(
+      y = max(.data[[metric_name]], na.rm = TRUE) * 1.10,
+      .groups = "drop"
+    )
+
+  welch_plot_df <- welch_table %>%
+    left_join(y_positions, by = "treatment") %>%
+    mutate(
+      yend = y,
+      label_y = y * 1.04
+    )
+
+  y_max <- max(
+    welch_plot_df$label_y,
+    plot_df[[metric_name]],
+    na.rm = TRUE
+  )
+
+  plot <- ggplot(
+    plot_df,
+    aes(
+      x = treatment,
+      y = .data[[metric_name]],
+      fill = genotype,
+      colour = genotype
+    )
+  ) +
+    geom_boxplot(
+      position = position_dodge(0.7),
+      width = 0.45,
+      alpha = 0.35,
+      linewidth = 0.7,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      position = position_jitterdodge(
+        jitter.width = 0.12,
+        dodge.width = 0.7
+      ),
+      size = 1.6,
+      alpha = 0.9
+    ) +
+    geom_segment(
+      data = welch_plot_df,
+      aes(x = x, xend = xend, y = y, yend = yend),
+      inherit.aes = FALSE,
+      linewidth = 0.5,
+      colour = "black"
+    ) +
+    geom_text(
+      data = welch_plot_df,
+      aes(x = treatment_x, y = label_y, label = p_label),
+      inherit.aes = FALSE,
+      size = 4
+    ) +
+    scale_fill_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+    scale_colour_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+    coord_cartesian(ylim = c(0, y_max * 1.15), clip = "off") +
+    scamp_theme +
+    labs(
+      x = "Treatment",
+      y = y_label,
+      title = plot_title
+    )
+
+  list(
+    plot = plot,
+    anova = anova_table,
+    welch = welch_table,
+    data = plot_df
+  )
+}
+```
+
+# 5. SCAMP fluorescence metric analyses
+
+```{r fluorescence-metric-analyses}
+integrated_result <- make_grouped_metric_analysis(
+  data = scamp_metric_df,
+  metric = integrated_fluorescence,
+  y_label = "Integrated fluorescence (a.u.)",
+  plot_title = "Integrated fluorescence",
+  metric_id = "integrated_fluorescence"
+)
+
+positive_area_result <- make_grouped_metric_analysis(
+  data = scamp_metric_df,
+  metric = positive_area,
+  y_label = paste0(
+    "Positive area (%)\nThreshold = ",
+    round(positive_threshold, 2),
+    " a.u."
+  ),
+  plot_title = "Extent of spinal mineralization",
+  metric_id = "positive_area"
+)
+
+mean_positive_result <- make_grouped_metric_analysis(
+  data = scamp_metric_df,
+  metric = mean_positive_fluorescence,
+  y_label = paste0(
+    "Mean positive fluorescence (a.u.)\nThreshold = ",
+    round(positive_threshold, 2),
+    " a.u."
+  ),
+  plot_title = "Mineralization density",
+  metric_id = "mean_positive_fluorescence"
+)
+
+p_integrated <- integrated_result$plot
+p_positive_area <- positive_area_result$plot
+p_density <- mean_positive_result$plot
+
+fluorescence_anova_results <- bind_rows(
+  integrated_result$anova,
+  positive_area_result$anova,
+  mean_positive_result$anova
+)
+
+fluorescence_welch_results <- bind_rows(
+  integrated_result$welch,
+  positive_area_result$welch,
+  mean_positive_result$welch
+)
+
+write.csv2(
+  fluorescence_anova_results,
+  file.path(statistics_dir, "SCAMP_fluorescence_two_way_ANOVA_results.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  fluorescence_welch_results,
+  file.path(statistics_dir, "SCAMP_fluorescence_within_treatment_Welch_BH_results.csv"),
+  row.names = FALSE
+)
+
+kable(fluorescence_anova_results, caption = "SCAMP fluorescence metric two-way ANOVA results")
+kable(fluorescence_welch_results, caption = "SCAMP fluorescence metric within-treatment Welch tests with BH correction")
+```
+
+# 6. Integrated fluorescence variability analysis
+
+```{r integrated-levene}
+## Brown-Forsythe Levene test: genotype-specific variance comparison
+## within each treatment for integrated fluorescence.
+## This tests whether inter-individual variability differs between genotypes.
+
+integrated_levene_results <- scamp_metric_df %>%
+  group_by(treatment) %>%
+  summarise(
+    p_raw = safe_levene_p(
+      cur_data(),
+      value_col = "integrated_fluorescence",
+      group_col = "genotype"
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    metric_id = "integrated_fluorescence",
+    metric = "Integrated fluorescence",
+    test = "Brown-Forsythe Levene test; center = median",
+    p_adj_BH = p.adjust(p_raw, method = "BH"),
+    p_label = format_p_stars(p_adj_BH),
+    p_raw_formatted = format_p_value(p_raw),
+    p_adj_BH_formatted = format_p_value(p_adj_BH)
+  ) %>%
+  select(metric_id, metric, treatment, test, p_raw, p_adj_BH, p_label, everything())
+
+write.csv2(
+  integrated_levene_results,
+  file.path(statistics_dir, "SCAMP_integrated_fluorescence_Levene_BrownForsythe_BH_results.csv"),
+  row.names = FALSE
+)
+
+kable(integrated_levene_results, caption = "Integrated fluorescence variance comparison between genotypes within treatment")
+```
+
+# 7. Ribbon plot of spatial mineralization pattern
+
+```{r ribbon-plot, fig.width=12, fig.height=5}
+long_df <- scamp_metric_df %>%
+  select(fish, genotype, treatment) %>%
+  bind_cols(as.data.frame(pixel_data)) %>%
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "Pixel",
+    values_to = "Intensity"
+  ) %>%
+  mutate(
+    Pixel = as.numeric(gsub("V", "", Pixel))
+  )
+
+ribbon_df <- long_df %>%
+  group_by(Pixel, genotype, treatment) %>%
+  summarise(
+    n = sum(!is.na(Intensity)),
+    mean = mean(Intensity, na.rm = TRUE),
+    sd = sd(Intensity, na.rm = TRUE),
+    sem = sd / sqrt(n),
+    CI_lower = ifelse(
+      n > 1,
+      pmax(mean - qt(0.975, n - 1) * sem, 0),
+      NA_real_
+    ),
+    CI_upper = ifelse(
+      n > 1,
+      mean + qt(0.975, n - 1) * sem,
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+positive_regions <- ribbon_df %>%
+  group_by(genotype, treatment) %>%
+  arrange(Pixel, .by_group = TRUE) %>%
+  mutate(
+    positive = mean > positive_threshold,
+    region = cumsum(positive != lag(positive, default = FALSE))
+  ) %>%
+  filter(positive) %>%
+  group_by(genotype, treatment, region) %>%
+  summarise(
+    xmin = min(Pixel),
+    xmax = max(Pixel),
+    .groups = "drop"
+  )
+
+p_ribbon <- ggplot(
+  ribbon_df,
+  aes(
+    x = Pixel,
+    y = mean,
+    colour = genotype,
+    fill = genotype
+  )
+) +
+  geom_rect(
+    data = positive_regions,
+    aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = genotype),
+    inherit.aes = FALSE,
+    alpha = 0.08,
+    colour = NA
+  ) +
+  geom_ribbon(
+    aes(ymin = CI_lower, ymax = CI_upper),
+    alpha = 0.30,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  geom_hline(
+    yintercept = positive_threshold,
+    linetype = "dashed",
+    colour = "grey35"
+  ) +
+  facet_wrap(~ treatment, nrow = 2) +
+  scale_colour_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+  scale_fill_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+  coord_cartesian(ylim = c(0, max(ribbon_df$CI_upper, na.rm = TRUE) * 1.05)) +
+  scamp_theme +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Normalised spine position",
+    y = "Mean fluorescence intensity (a.u.)",
+    title = "Spatial mineralization profile"
+  )
+
+p_ribbon
+```
+
+# 8. Calcified vertebrae analysis
+
+```{r calcified-vertebrae-analysis}
+if (!file.exists(calcified_data_path)) {
+  warning("Calcified vertebrae input file not found: ", calcified_data_path)
+  calc_df <- NULL
+} else {
+  calc_raw <- read.csv2(calcified_data_path, header = TRUE, check.names = TRUE)
+
+  calc_df <- calc_raw %>%
+    mutate(
+      genotype = factor(
+        Genotype,
+        levels = names(genotype_labels),
+        labels = genotype_labels
+      ),
+      treatment = factor(
+        Treatment,
+        levels = treatment_levels,
+        labels = treatment_labels
+      ),
+      calcified_vertebrae = as.numeric(`Calcified.vertebrae.all`)
+    ) %>%
+    filter(!is.na(genotype), !is.na(treatment), !is.na(calcified_vertebrae))
+
+  calcified_result <- make_grouped_metric_analysis(
+    data = calc_df,
+    metric = calcified_vertebrae,
+    y_label = "Calcified vertebrae all (number)",
+    plot_title = "Calcified vertebrae count",
+    metric_id = "calcified_vertebrae_all"
+  )
+
+  p_calcified_vertebrae <- calcified_result$plot
+
+  write.csv2(
+    calc_df,
+    file.path(statistics_dir, "SCAMP_calcified_vertebrae_per_fish.csv"),
+    row.names = FALSE
+  )
+
+  write.csv2(
+    calcified_result$anova,
+    file.path(statistics_dir, "SCAMP_calcified_vertebrae_two_way_ANOVA_results.csv"),
+    row.names = FALSE
+  )
+
+  write.csv2(
+    calcified_result$welch,
+    file.path(statistics_dir, "SCAMP_calcified_vertebrae_within_treatment_Welch_BH_results.csv"),
+    row.names = FALSE
+  )
+
+  kable(calcified_result$anova, caption = "Calcified vertebrae two-way ANOVA results")
+  kable(calcified_result$welch, caption = "Calcified vertebrae within-treatment Welch tests with BH correction")
+
+
+  p_calcified_vertebrae
+}
+```
+
+# 9. Supplementary treatment-response analyses within genotype
+
+This section generates SI-style plots where each calcification-related metric is faceted by genotype. Within each genotype, treatment groups are compared against the baseline condition (`-MB -PPi`) using Welch's t-tests followed by Benjamini-Hochberg correction.
+
+```{r si-baseline-treatment-functions}
+## -----------------------------
+## SI helper: treatment comparisons against baseline within genotype
+## -----------------------------
+
+treatment_cols <- c(
+  "-MB\n-PPi" = "#4D4D4D",
+  "+MB\n-PPi" = "#377EB8",
+  "-MB\n+PPi" = "#4DAF4A",
+  "+MB\n+PPi" = "#E69F00"
+)
+
+safe_welch_baseline_p <- function(data,
+                                  value_col,
+                                  group_col = "treatment",
+                                  baseline_level,
+                                  comparison_level) {
+
+  ## Keep only the baseline and the current comparison group, then rebuild
+  ## a two-level factor. This is important because treatment is usually stored
+  ## as a factor with all treatment levels; t.test() requires exactly two
+  ## observed groups and can otherwise fail or return NA through tryCatch().
+  local_df <- data %>%
+    filter(
+      as.character(.data[[group_col]]) %in% c(baseline_level, comparison_level),
+      !is.na(.data[[value_col]])
+    ) %>%
+    mutate(
+      comparison_group = factor(
+        as.character(.data[[group_col]]),
+        levels = c(baseline_level, comparison_level)
+      )
+    ) %>%
+    droplevels()
+
+  if (nlevels(local_df$comparison_group) < 2) return(NA_real_)
+
+  split_x <- split(
+    local_df[[value_col]],
+    local_df$comparison_group,
+    drop = TRUE
+  )
+
+  if (length(split_x) < 2) return(NA_real_)
+
+  if (any(sapply(split_x, function(v) sum(!is.na(v)) < 2))) return(NA_real_)
+
+  if (sd(local_df[[value_col]], na.rm = TRUE) < .Machine$double.eps) return(NA_real_)
+
+  tryCatch(
+    t.test(
+      local_df[[value_col]] ~ local_df$comparison_group,
+      var.equal = FALSE
+    )$p.value,
+    error = function(e) NA_real_
+  )
+}
+
+make_baseline_treatment_analysis <- function(data,
+                                             metric,
+                                             y_label,
+                                             plot_title,
+                                             metric_id,
+                                             baseline_label = treatment_labels[1]) {
+
+  metric <- rlang::ensym(metric)
+  metric_name <- rlang::as_string(metric)
+
+  plot_df <- data %>%
+    filter(
+      !is.na(.data[[metric_name]]),
+      !is.na(genotype),
+      !is.na(treatment)
+    ) %>%
+    mutate(
+      treatment = factor(treatment, levels = treatment_labels),
+      genotype = factor(genotype, levels = genotype_labels)
+    )
+
+  comparison_levels <- setdiff(treatment_labels, baseline_label)
+
+  stat_df <- expand.grid(
+    genotype = levels(plot_df$genotype),
+    comparison = comparison_levels,
+    stringsAsFactors = FALSE
+  ) %>%
+    as_tibble() %>%
+    rowwise() %>%
+    mutate(
+      p_raw = {
+        current_genotype <- genotype
+
+        safe_welch_baseline_p(
+          data = plot_df %>% filter(genotype == current_genotype),
+          value_col = metric_name,
+          group_col = "treatment",
+          baseline_level = baseline_label,
+          comparison_level = comparison
+        )
+      },
+      n_baseline = {
+        current_genotype <- genotype
+
+        sum(
+          plot_df$genotype == current_genotype &
+            plot_df$treatment == baseline_label &
+            !is.na(plot_df[[metric_name]])
+        )
+      },
+      n_comparison = {
+        current_genotype <- genotype
+
+        sum(
+          plot_df$genotype == current_genotype &
+            plot_df$treatment == comparison &
+            !is.na(plot_df[[metric_name]])
+        )
+      }
+    ) %>%
+    ungroup() %>%
+    group_by(genotype) %>%
+    mutate(
+      p_adj_BH = p.adjust(p_raw, method = "BH"),
+      p_label = format_p_stars(p_adj_BH),
+      p_raw_formatted = format_p_value(p_raw),
+      p_adj_BH_formatted = format_p_value(p_adj_BH),
+      comparison_rank = row_number(),
+      x = match(baseline_label, treatment_labels),
+      xend = match(comparison, treatment_labels),
+      label_x = (x + xend) / 2
+    ) %>%
+    ungroup() %>%
+    mutate(
+      metric_id = metric_id,
+      metric = plot_title,
+      baseline = baseline_label
+    )
+
+  y_positions <- plot_df %>%
+    group_by(genotype) %>%
+    summarise(
+      y_base = max(.data[[metric_name]], na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  stat_plot_df <- stat_df %>%
+    left_join(y_positions, by = "genotype") %>%
+    group_by(genotype) %>%
+    arrange(xend, .by_group = TRUE) %>%
+    mutate(
+      y = y_base * (1.10 + 0.10 * (row_number() - 1)),
+      yend = y,
+      label_y = y * 1.035
+    ) %>%
+    ungroup()
+
+  y_max <- max(
+    stat_plot_df$label_y,
+    plot_df[[metric_name]],
+    na.rm = TRUE
+  )
+
+  plot <- ggplot(
+    plot_df,
+    aes(
+      x = treatment,
+      y = .data[[metric_name]],
+      fill = treatment,
+      colour = treatment
+    )
+  ) +
+    geom_boxplot(
+      width = 0.55,
+      alpha = 0.35,
+      linewidth = 0.7,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.12,
+      size = 1.6,
+      alpha = 0.9
+    ) +
+    geom_segment(
+      data = stat_plot_df,
+      aes(x = x, xend = xend, y = y, yend = yend),
+      inherit.aes = FALSE,
+      linewidth = 0.5,
+      colour = "black"
+    ) +
+    geom_text(
+      data = stat_plot_df,
+      aes(x = label_x, y = label_y, label = p_label),
+      inherit.aes = FALSE,
+      size = 3.6
+    ) +
+    facet_wrap(~genotype, nrow = 1) +
+    scale_fill_manual(values = treatment_cols) +
+    scale_colour_manual(values = treatment_cols) +
+    coord_cartesian(ylim = c(0, y_max * 1.12), clip = "off") +
+    scamp_theme +
+    labs(
+      x = "Treatment",
+      y = y_label,
+      title = plot_title,
+      subtitle = paste0("Within-genotype comparison against baseline: ", gsub("\\n", " ", baseline_label))
+    ) +
+    theme(
+      legend.position = "none",
+      strip.text = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 0, hjust = 0.5)
+    )
+
+  list(
+    plot = plot,
+    statistics = stat_df %>%
+      select(
+        metric_id, metric, genotype, baseline, comparison,
+        n_baseline, n_comparison,
+        p_raw, p_adj_BH, p_label,
+        p_raw_formatted, p_adj_BH_formatted
+      ),
+    data = plot_df
+  )
+}
+```
+
+```{r si-baseline-treatment-analyses, fig.width=12, fig.height=10}
+## -----------------------------
+## SCAMP fluorescence metrics: treatment effects within each genotype
+## -----------------------------
+
+si_integrated_result <- make_baseline_treatment_analysis(
+  data = scamp_metric_df,
+  metric = integrated_fluorescence,
+  y_label = "Integrated fluorescence (a.u.)",
+  plot_title = "Integrated fluorescence",
+  metric_id = "integrated_fluorescence"
+)
+
+si_positive_area_result <- make_baseline_treatment_analysis(
+  data = scamp_metric_df,
+  metric = positive_area,
+  y_label = paste0(
+    "Positive area (%)\nThreshold = ",
+    round(positive_threshold, 2),
+    " a.u."
+  ),
+  plot_title = "Positive area",
+  metric_id = "positive_area"
+)
+
+si_density_result <- make_baseline_treatment_analysis(
+  data = scamp_metric_df,
+  metric = mean_positive_fluorescence,
+  y_label = paste0(
+    "Mean positive fluorescence (a.u.)\nThreshold = ",
+    round(positive_threshold, 2),
+    " a.u."
+  ),
+  plot_title = "Mean positive fluorescence",
+  metric_id = "mean_positive_fluorescence"
+)
+
+si_baseline_stats <- bind_rows(
+  si_integrated_result$statistics,
+  si_positive_area_result$statistics,
+  si_density_result$statistics
+)
+
+if (exists("calc_df") && !is.null(calc_df)) {
+  si_calcified_result <- make_baseline_treatment_analysis(
+    data = calc_df,
+    metric = calcified_vertebrae,
+    y_label = "Calcified vertebrae all (number)",
+    plot_title = "Calcified vertebrae count",
+    metric_id = "calcified_vertebrae_all"
+  )
+
+  si_baseline_stats <- bind_rows(
+    si_baseline_stats,
+    si_calcified_result$statistics
+  )
+}
+
+write.csv2(
+  si_baseline_stats,
+  file.path(statistics_dir, "SI_within_genotype_treatment_vs_baseline_Welch_BH_results.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  si_baseline_stats %>% filter(metric_id != "calcified_vertebrae_all"),
+  file.path(statistics_dir, "SI_SCAMP_metrics_within_genotype_treatment_vs_baseline_Welch_BH_results.csv"),
+  row.names = FALSE
+)
+
+if (exists("si_calcified_result")) {
+  write.csv2(
+    si_calcified_result$statistics,
+    file.path(statistics_dir, "SI_calcified_vertebrae_within_genotype_treatment_vs_baseline_Welch_BH_results.csv"),
+    row.names = FALSE
+  )
+}
+
+p_si_integrated <- si_integrated_result$plot
+p_si_positive_area <- si_positive_area_result$plot
+p_si_density <- si_density_result$plot
+if (exists("si_calcified_result")) {
+  p_si_calcified_vertebrae <- si_calcified_result$plot
+}
+
+si_calcification_metrics_plot <- if (exists("p_si_calcified_vertebrae")) {
+  (p_si_integrated / p_si_positive_area / p_si_density / p_si_calcified_vertebrae) +
+    plot_annotation(tag_levels = "A")
+} else {
+  (p_si_integrated / p_si_positive_area / p_si_density) +
+    plot_annotation(tag_levels = "A")
+}
+
+si_calcification_metrics_plot
+```
+
+```{r save-si-baseline-treatment-figures}
+ggsave(
+  file.path(figure_dir, "SI_calcification_metrics_by_genotype_treatment_vs_baseline.pdf"),
+  si_calcification_metrics_plot,
+  width = 12,
+  height = if (exists("p_si_calcified_vertebrae")) 16 else 12,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(figure_dir, "SI_calcification_metrics_by_genotype_treatment_vs_baseline.png"),
+  si_calcification_metrics_plot,
+  width = 12,
+  height = if (exists("p_si_calcified_vertebrae")) 16 else 12,
+  dpi = 600
+)
+```
+
+# 10. Biomarker plots
+
+```{r biomarker-plots, fig.width=12, fig.height=8}
+p_integrated
+p_positive_area
+p_density
+if (exists("p_calcified_vertebrae")) p_calcified_vertebrae
+```
+
+# 11. Combined statistics export
+
+```{r combined-statistics-export}
+if (exists("calcified_result")) {
+  combined_anova_results <- bind_rows(
+    fluorescence_anova_results,
+    calcified_result$anova
+  )
+
+  combined_welch_results <- bind_rows(
+    fluorescence_welch_results,
+    calcified_result$welch
+  )
+} else {
+  combined_anova_results <- fluorescence_anova_results
+  combined_welch_results <- fluorescence_welch_results
+}
+
+write.csv2(
+  combined_anova_results,
+  file.path(statistics_dir, "SCAMP_all_two_way_ANOVA_results.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  combined_welch_results,
+  file.path(statistics_dir, "SCAMP_all_within_treatment_Welch_BH_results.csv"),
+  row.names = FALSE
+)
+
+kable(combined_anova_results, caption = "Combined two-way ANOVA results")
+kable(combined_welch_results, caption = "Combined within-treatment Welch tests with BH correction")
+```
+
+# 12. Final figure export
+
+```{r final-export, fig.width=12, fig.height=10}
+if (exists("p_calcified_vertebrae")) {
+  final_figure <-
+    p_ribbon /
+    ((p_integrated | p_positive_area) /
+       (p_density | p_calcified_vertebrae)) +
+    plot_layout(heights = c(1.1, 1.6)) +
+    plot_annotation(
+      title = "SCAMP mineralization analysis",
+      tag_levels = "A"
+    )
+} else {
+  final_figure <-
+    p_ribbon /
+    (p_integrated | p_positive_area | p_density) +
+    plot_layout(heights = c(1.2, 1)) +
+    plot_annotation(
+      title = "SCAMP mineralization analysis",
+      tag_levels = "A"
+    )
+}
+
+ggsave(
+  filename = file.path(figure_dir, "SCAMP_MB_PPi_summary_figure.pdf"),
+  plot = final_figure,
+  width = 12,
+  height = 10,
+  units = "in",
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(figure_dir, "SCAMP_MB_PPi_summary_figure.png"),
+  plot = final_figure,
+  width = 12,
+  height = 10,
+  units = "in",
+  dpi = 600
+)
+
+final_figure
+```
+
+# 13. Session information
+
+```{r session-info}
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(qc_dir, "sessionInfo.txt")
+)
+
+sessionInfo()
+```

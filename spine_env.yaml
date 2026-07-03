@@ -1,0 +1,50 @@
+name: spine
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Keep Python at 3.11 for broad compatibility with Tk, scientific packages,
+  # microscopy readers, and binary wheels on Windows/macOS/Linux.
+  - python=3.11
+
+  # Core numerical stack
+  - numpy
+  - scipy
+  - scikit-image>=0.21
+  - matplotlib
+
+  # GUI
+  - tk
+
+  # Image I/O and metadata
+  - pillow
+  - tifffile
+  - imagecodecs
+  - roifile
+  - xarray
+
+  # Tables / exports
+  - pandas
+  - openpyxl
+
+  # Optional but useful fallback image reader/writer
+  - opencv
+
+  # Pip is used for BioIO plugins because the BioIO reader ecosystem is
+  # distributed primarily through PyPI plugin packages.
+  - pip
+  - pip:
+      # Modern microscopy image reader framework.
+      - bioio
+
+      # Zeiss CZI reader plugin used by SCAMP for .czi stacks/hyperstacks.
+      - bioio-czi
+
+      # Modern ttk/Tk theme layer used by scamp_darkly.py.
+      - ttkbootstrap
+
+      # Optional BioIO readers for common microscopy formats. These are useful
+      # if Open is used on OME-TIFF/OME-Zarr data instead of plain TIFF/CZI.
+      - bioio-ome-tiff
+      - bioio-ome-zarr

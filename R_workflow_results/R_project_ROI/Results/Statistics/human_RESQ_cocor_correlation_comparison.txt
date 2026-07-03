@@ -1,0 +1,15 @@
+
+  Results of a comparison of two correlations based on independent groups
+
+Comparison between r1.jk (Area, AP_axis) = 0.4817 and r2.hm (Area, AP_axis) = -0.3265
+Difference: r1.jk - r2.hm = 0.8082
+Data: het: j = Area, k = AP_axis; mut: h = Area, m = AP_axis
+Group sizes: n1 = 67, n2 = 23
+Null hypothesis: r1.jk is equal to r2.hm
+Alternative hypothesis: r1.jk is not equal to r2.hm (two-sided)
+Alpha: 0.05
+
+fisher1925: Fisher's z (1925)
+  z = 3.3732, p-value = 0.0007
+  Null hypothesis rejected
+

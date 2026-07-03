@@ -1,0 +1,2 @@
+"metric_id";"metric";"comparison";"test";"p_raw";"p_adj_BH";"p_label";"p_raw_formatted";"p_adj_BH_formatted"
+"integrated_fluorescence";"Integrated fluorescence";"abcc6a+/- vs abcc6a-/-";"Brown-Forsythe Levene test; center = median";0,0589399212649703;0,0589399212649703;"ns";"5.894e-02";"5.894e-02"

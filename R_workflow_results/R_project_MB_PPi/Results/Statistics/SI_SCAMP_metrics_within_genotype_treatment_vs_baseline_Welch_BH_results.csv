@@ -1,0 +1,55 @@
+"metric_id";"metric";"genotype";"baseline";"comparison";"n_baseline";"n_comparison";"p_raw";"p_adj_BH";"p_label";"p_raw_formatted";"p_adj_BH_formatted"
+"integrated_fluorescence";"Integrated fluorescence";"abcc6a+/-";"-MB
+-PPi";"+MB
+-PPi";11;10;0,0113344870889883;0,0170017306334825;"*";"1.133e-02";"1.700e-02"
+"integrated_fluorescence";"Integrated fluorescence";"abcc6a-/-";"-MB
+-PPi";"+MB
+-PPi";11;13;0,518553616972957;0,518553616972957;"ns";"5.186e-01";"5.186e-01"
+"integrated_fluorescence";"Integrated fluorescence";"abcc6a+/-";"-MB
+-PPi";"-MB
++PPi";11;8;0,00708354571126204;0,0170017306334825;"*";"7.084e-03";"1.700e-02"
+"integrated_fluorescence";"Integrated fluorescence";"abcc6a-/-";"-MB
+-PPi";"-MB
++PPi";11;16;0,0533498104096725;0,160049431229017;"ns";"5.335e-02";"1.600e-01"
+"integrated_fluorescence";"Integrated fluorescence";"abcc6a+/-";"-MB
+-PPi";"+MB
++PPi";11;10;0,111334349114888;0,111334349114888;"ns";"1.113e-01";"1.113e-01"
+"integrated_fluorescence";"Integrated fluorescence";"abcc6a-/-";"-MB
+-PPi";"+MB
++PPi";11;13;0,489591799621354;0,518553616972957;"ns";"4.896e-01";"5.186e-01"
+"positive_area";"Positive area";"abcc6a+/-";"-MB
+-PPi";"+MB
+-PPi";11;10;0,0137400995801204;0,0206101493701806;"*";"1.374e-02";"2.061e-02"
+"positive_area";"Positive area";"abcc6a-/-";"-MB
+-PPi";"+MB
+-PPi";11;13;0,753391115153626;0,97757864183764;"ns";"7.534e-01";"9.776e-01"
+"positive_area";"Positive area";"abcc6a+/-";"-MB
+-PPi";"-MB
++PPi";11;8;0,00311111827481107;0,00933335482443321;"**";"3.111e-03";"9.333e-03"
+"positive_area";"Positive area";"abcc6a-/-";"-MB
+-PPi";"-MB
++PPi";11;16;0,377116160288096;0,97757864183764;"ns";"3.771e-01";"9.776e-01"
+"positive_area";"Positive area";"abcc6a+/-";"-MB
+-PPi";"+MB
++PPi";11;10;0,0391327251147669;0,0391327251147669;"*";"3.913e-02";"3.913e-02"
+"positive_area";"Positive area";"abcc6a-/-";"-MB
+-PPi";"+MB
++PPi";11;13;0,97757864183764;0,97757864183764;"ns";"9.776e-01";"9.776e-01"
+"mean_positive_fluorescence";"Mean positive fluorescence";"abcc6a+/-";"-MB
+-PPi";"+MB
+-PPi";10;9;0,0313519374148925;0,0470279061223387;"*";"3.135e-02";"4.703e-02"
+"mean_positive_fluorescence";"Mean positive fluorescence";"abcc6a-/-";"-MB
+-PPi";"+MB
+-PPi";11;13;0,371865645139805;0,371865645139805;"ns";"3.719e-01";"3.719e-01"
+"mean_positive_fluorescence";"Mean positive fluorescence";"abcc6a+/-";"-MB
+-PPi";"-MB
++PPi";10;8;0,000159711603821512;0,000479134811464536;"***";"1.597e-04";"4.791e-04"
+"mean_positive_fluorescence";"Mean positive fluorescence";"abcc6a-/-";"-MB
+-PPi";"-MB
++PPi";11;16;0,00555752302689127;0,0166725690806738;"*";"5.558e-03";"1.667e-02"
+"mean_positive_fluorescence";"Mean positive fluorescence";"abcc6a+/-";"-MB
+-PPi";"+MB
++PPi";10;10;0,0647994108737636;0,0647994108737636;"ns";"6.480e-02";"6.480e-02"
+"mean_positive_fluorescence";"Mean positive fluorescence";"abcc6a-/-";"-MB
+-PPi";"+MB
++PPi";11;13;0,126630988369402;0,189946482554103;"ns";"1.266e-01";"1.899e-01"

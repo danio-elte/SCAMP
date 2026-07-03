@@ -1,0 +1,9 @@
+"metric_id";"metric";"treatment";"p_raw";"p_adj_BH";"p_label";"p_raw_formatted";"p_adj_BH_formatted";"treatment_x";"x";"xend"
+"calcified_vertebrae_all";"Calcified vertebrae count";"-MB
+-PPi";0,528256763751321;0,694999751802783;"ns";"5.283e-01";"6.950e-01";1;0,82;1,18
+"calcified_vertebrae_all";"Calcified vertebrae count";"+MB
+-PPi";2,91509864613371e-06;1,16603945845348e-05;"****";"2.915e-06";"1.166e-05";2;1,82;2,18
+"calcified_vertebrae_all";"Calcified vertebrae count";"-MB
++PPi";0,694999751802783;0,694999751802783;"ns";"6.950e-01";"6.950e-01";3;2,82;3,18
+"calcified_vertebrae_all";"Calcified vertebrae count";"+MB
++PPi";0,41779978844607;0,694999751802783;"ns";"4.178e-01";"6.950e-01";4;3,82;4,18

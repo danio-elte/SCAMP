@@ -1,0 +1,495 @@
+---
+title: "Human RESQ fused-region analysis"
+author: "SCAMP / RESQ analysis workflow"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## ==========================================================
+## Human RESQ fused-region analysis
+## ==========================================================
+## Purpose:
+##   Analyse whether fused-region size is associated with AP-axis position
+##   and whether this relationship differs between genotypes.
+##
+## Expected input columns:
+##   fishID, genotype, Area number, Area, AP_axis
+##
+## Main outputs:
+##   Results/Figures/
+##   Results/Statistics/
+##   Results/QC/
+## ==========================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(cocor)
+  library(broom)
+})
+
+## -----------------------------
+## User settings
+## -----------------------------
+
+input_file <- "fusion-human-resq.xlsx"
+input_sheet <- 1
+
+results_dir <- "Results"
+fig_dir <- file.path(results_dir, "Figures")
+stats_dir <- file.path(results_dir, "Statistics")
+qc_dir <- file.path(results_dir, "QC")
+
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(stats_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+
+genotype_levels <- c("2_het", "3_mut")
+
+genotype_labels <- c(
+  "2_het" = "abcc6a+/-",
+  "3_mut" = "abcc6a-/-"
+)
+
+genotype_cols <- c(
+  "2_het" = "#261A68",
+  "3_mut" = "#B61515"
+)
+
+## Binning setting for optional AP-axis summary
+bin_width <- 100
+
+## -----------------------------
+## Helper functions
+## -----------------------------
+
+format_p_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "n.c.",
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+safe_cor_test <- function(data, x_col, y_col, method = "kendall") {
+  x <- data[[x_col]]
+  y <- data[[y_col]]
+  ok <- is.finite(x) & is.finite(y)
+
+  if (sum(ok) < 3) {
+    return(tibble(
+      estimate = NA_real_,
+      statistic = NA_real_,
+      p.value = NA_real_,
+      method = method,
+      n = sum(ok)
+    ))
+  }
+
+  out <- tryCatch(
+    cor.test(x[ok], y[ok], method = method, exact = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(out)) {
+    return(tibble(
+      estimate = NA_real_,
+      statistic = NA_real_,
+      p.value = NA_real_,
+      method = method,
+      n = sum(ok)
+    ))
+  }
+
+  broom::tidy(out) %>%
+    mutate(
+      method = method,
+      n = sum(ok)
+    )
+}
+
+write_session_info <- function(path) {
+  sink(path)
+  print(sessionInfo())
+  sink()
+}
+```
+
+# 1. Load and clean data
+
+```{r load-data}
+raw_dat <- read_excel(input_file, sheet = input_sheet)
+
+required_cols <- c("fishID", "genotype", "Area number", "Area", "AP_axis")
+missing_cols <- setdiff(required_cols, names(raw_dat))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required column(s): ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+resq_df <- raw_dat %>%
+  as_tibble() %>%
+  mutate(
+    fishID = factor(fishID),
+    genotype_raw = as.character(genotype),
+    genotype = factor(genotype_raw, levels = genotype_levels),
+    genotype_label = factor(
+      genotype_labels[as.character(genotype)],
+      levels = unname(genotype_labels)
+    ),
+    `Area number` = factor(`Area number`),
+    Area = as.numeric(Area),
+    AP_axis = as.numeric(AP_axis)
+  ) %>%
+  filter(
+    !is.na(genotype),
+    is.finite(Area),
+    is.finite(AP_axis)
+  )
+
+if (nrow(resq_df) == 0) {
+  stop("No usable rows remained after filtering. Check genotype labels and numeric columns.")
+}
+
+write_csv(
+  resq_df,
+  file.path(stats_dir, "human_RESQ_cleaned_input_data.csv")
+)
+
+resq_df
+```
+
+# 2. Sample overview
+
+```{r sample-overview}
+sample_summary <- resq_df %>%
+  group_by(genotype, genotype_label) %>%
+  summarise(
+    n_regions = n(),
+    n_fish = n_distinct(fishID),
+    mean_area = mean(Area, na.rm = TRUE),
+    median_area = median(Area, na.rm = TRUE),
+    sd_area = sd(Area, na.rm = TRUE),
+    min_area = min(Area, na.rm = TRUE),
+    max_area = max(Area, na.rm = TRUE),
+    mean_AP_axis = mean(AP_axis, na.rm = TRUE),
+    min_AP_axis = min(AP_axis, na.rm = TRUE),
+    max_AP_axis = max(AP_axis, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  sample_summary,
+  file.path(stats_dir, "human_RESQ_sample_summary.csv")
+)
+
+sample_summary
+```
+
+# 3. Kendall correlation analysis
+
+This analysis tests whether fused-region area is associated with AP-axis position. Kendall's rank correlation is used because it is robust for monotonic relationships and does not assume normally distributed variables.
+
+```{r kendall-correlations}
+cor_overall <- safe_cor_test(
+  resq_df,
+  x_col = "Area",
+  y_col = "AP_axis",
+  method = "kendall"
+) %>%
+  mutate(group = "all")
+
+cor_by_genotype <- resq_df %>%
+  group_by(genotype, genotype_label) %>%
+  group_modify(~ safe_cor_test(.x, "Area", "AP_axis", method = "kendall")) %>%
+  ungroup() %>%
+  mutate(group = as.character(genotype))
+
+cor_results <- bind_rows(
+  cor_overall,
+  cor_by_genotype
+) %>%
+  mutate(
+    p_label = format_p_stars(p.value)
+  )
+
+write_csv(
+  cor_results,
+  file.path(stats_dir, "human_RESQ_Kendall_correlation_results.csv")
+)
+
+cor_results
+```
+
+# 4. Genotype-specific correlation comparison
+
+This analysis asks whether the Area-AP relationship differs between genotypes. The `cocor` package is used to compare two independent correlations.
+
+```{r compare-correlations}
+resq_het <- resq_df %>% filter(genotype == "2_het")
+resq_mut <- resq_df %>% filter(genotype == "3_mut")
+
+dat_list <- list(
+  het = as.data.frame(resq_het),
+  mut = as.data.frame(resq_mut)
+)
+
+cocor_result <- NULL
+cocor_text_path <- file.path(stats_dir, "human_RESQ_cocor_correlation_comparison.txt")
+
+if (nrow(resq_het) >= 3 && nrow(resq_mut) >= 3) {
+  cocor_result <- cocor(
+    formula = ~ Area + AP_axis | Area + AP_axis,
+    data = dat_list,
+    test = "fisher1925"
+  )
+
+  capture.output(
+    cocor_result,
+    file = cocor_text_path
+  )
+} else {
+  writeLines(
+    "cocor comparison was not run because at least one genotype had fewer than 3 observations.",
+    cocor_text_path
+  )
+}
+
+cocor_result
+```
+
+# 5. Linear interaction model
+
+This model tests whether the relationship between fused-region area and AP-axis position differs by genotype.
+
+```{r linear-interaction-model}
+lm_fit <- lm(
+  Area ~ genotype * AP_axis,
+  data = resq_df
+)
+
+lm_coefficients <- broom::tidy(lm_fit) %>%
+  mutate(p_label = format_p_stars(p.value))
+
+lm_anova <- broom::tidy(anova(lm_fit)) %>%
+  mutate(p_label = format_p_stars(p.value))
+
+lm_glance <- broom::glance(lm_fit)
+
+write_csv(
+  lm_coefficients,
+  file.path(stats_dir, "human_RESQ_linear_model_coefficients.csv")
+)
+
+write_csv(
+  lm_anova,
+  file.path(stats_dir, "human_RESQ_linear_model_ANOVA.csv")
+)
+
+write_csv(
+  lm_glance,
+  file.path(stats_dir, "human_RESQ_linear_model_summary.csv")
+)
+
+lm_coefficients
+lm_anova
+lm_glance
+```
+
+# 6. Scatterplot with LOESS trend
+
+```{r scatterplot-loess, fig.width=10, fig.height=4}
+p_scatter_loess <- ggplot(
+  resq_df,
+  aes(
+    x = AP_axis,
+    y = Area,
+    colour = genotype,
+    fill = genotype
+  )
+) +
+  geom_point(
+    alpha = 0.65,
+    size = 2
+  ) +
+  geom_smooth(
+    method = "loess",
+    se = TRUE,
+    alpha = 0.20,
+    linewidth = 1
+  ) +
+  scale_colour_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scale_fill_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  theme_classic(base_size = 12) +
+  labs(
+    x = "AP-axis position",
+    y = "Fused region area",
+    title = "Fused region size along the AP axis",
+    colour = "Genotype",
+    fill = "Genotype"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(colour = "black")
+  )
+
+p_scatter_loess
+
+ggsave(
+  filename = file.path(fig_dir, "human_RESQ_scatterplot_LOESS.pdf"),
+  plot = p_scatter_loess,
+  width = 10,
+  height = 4,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "human_RESQ_scatterplot_LOESS.png"),
+  plot = p_scatter_loess,
+  width = 10,
+  height = 4,
+  dpi = 600
+)
+```
+
+# 7. Binned AP-axis summary
+
+Because AP-axis position is near-continuous, exact-position groups often contain only one observation. For mean ± SE visualization, AP-axis position is therefore binned.
+
+```{r binned-summary}
+ap_min <- floor(min(resq_df$AP_axis, na.rm = TRUE) / bin_width) * bin_width
+ap_max <- ceiling(max(resq_df$AP_axis, na.rm = TRUE) / bin_width) * bin_width + bin_width
+
+resq_binned <- resq_df %>%
+  mutate(
+    AP_bin = cut(
+      AP_axis,
+      breaks = seq(ap_min, ap_max, by = bin_width),
+      include.lowest = TRUE,
+      right = FALSE
+    ),
+    AP_bin_mid = as.numeric(sub("\\[(.*),(.*)\\)", "\\1", AP_bin)) + bin_width / 2
+  )
+
+summary_binned <- resq_binned %>%
+  group_by(genotype, genotype_label, AP_bin, AP_bin_mid) %>%
+  summarise(
+    n = n(),
+    n_fish = n_distinct(fishID),
+    mean_area = mean(Area, na.rm = TRUE),
+    sd_area = if_else(n > 1, sd(Area, na.rm = TRUE), NA_real_),
+    se_area = if_else(n > 1, sd_area / sqrt(n), NA_real_),
+    ymin = mean_area - se_area,
+    ymax = mean_area + se_area,
+    .groups = "drop"
+  )
+
+write_csv(
+  summary_binned,
+  file.path(stats_dir, "human_RESQ_binned_AP_axis_summary.csv")
+)
+
+summary_binned
+```
+
+```{r binned-plot, fig.width=10, fig.height=4}
+p_binned <- ggplot() +
+  geom_point(
+    data = resq_df,
+    aes(
+      x = AP_axis,
+      y = Area,
+      colour = genotype
+    ),
+    alpha = 0.35,
+    size = 1.8
+  ) +
+  geom_line(
+    data = summary_binned,
+    aes(
+      x = AP_bin_mid,
+      y = mean_area,
+      colour = genotype,
+      group = genotype
+    ),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = summary_binned,
+    aes(
+      x = AP_bin_mid,
+      y = mean_area,
+      colour = genotype
+    ),
+    size = 3
+  ) +
+  geom_errorbar(
+    data = summary_binned %>% filter(!is.na(se_area)),
+    aes(
+      x = AP_bin_mid,
+      ymin = ymin,
+      ymax = ymax,
+      colour = genotype
+    ),
+    width = bin_width * 0.15,
+    linewidth = 0.8
+  ) +
+  scale_colour_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  theme_classic(base_size = 12) +
+  labs(
+    x = paste0("AP-axis position, binned every ", bin_width, " units"),
+    y = "Fused region area",
+    title = "Binned fused-region size along the AP axis",
+    colour = "Genotype"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(colour = "black")
+  )
+
+p_binned
+
+ggsave(
+  filename = file.path(fig_dir, "human_RESQ_binned_mean_SE.pdf"),
+  plot = p_binned,
+  width = 10,
+  height = 4,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "human_RESQ_binned_mean_SE.png"),
+  plot = p_binned,
+  width = 10,
+  height = 4,
+  dpi = 600
+)
+```
+
+# 8. Save session information
+
+```{r session-info}
+write_session_info(
+  file.path(qc_dir, "human_RESQ_sessionInfo.txt")
+)
+```
