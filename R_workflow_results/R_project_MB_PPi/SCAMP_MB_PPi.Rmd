@@ -711,12 +711,13 @@ if (!file.exists(calcified_data_path)) {
 
 # 9. Supplementary treatment-response analyses within genotype
 
-This section generates SI-style plots where each calcification-related metric is faceted by genotype. Within each genotype, treatment groups are compared against the baseline condition (`-MB -PPi`) using Welch's t-tests followed by Benjamini-Hochberg correction.
+This section generates SI-style plots where each calcification-related metric is faceted by genotype. 
 
 ```{r si-baseline-treatment-functions}
-## -----------------------------
-## SI helper: treatment comparisons against baseline within genotype
-## -----------------------------
+## ============================================================
+## Supplementary pairwise treatment comparisons within genotype
+## Welch t-test + BH correction
+## ============================================================
 
 treatment_cols <- c(
   "-MB\n-PPi" = "#4D4D4D",
@@ -725,25 +726,21 @@ treatment_cols <- c(
   "+MB\n+PPi" = "#E69F00"
 )
 
-safe_welch_baseline_p <- function(data,
+safe_welch_pairwise_p <- function(data,
                                   value_col,
                                   group_col = "treatment",
-                                  baseline_level,
-                                  comparison_level) {
+                                  group1,
+                                  group2) {
 
-  ## Keep only the baseline and the current comparison group, then rebuild
-  ## a two-level factor. This is important because treatment is usually stored
-  ## as a factor with all treatment levels; t.test() requires exactly two
-  ## observed groups and can otherwise fail or return NA through tryCatch().
   local_df <- data %>%
     filter(
-      as.character(.data[[group_col]]) %in% c(baseline_level, comparison_level),
+      as.character(.data[[group_col]]) %in% c(group1, group2),
       !is.na(.data[[value_col]])
     ) %>%
     mutate(
       comparison_group = factor(
         as.character(.data[[group_col]]),
-        levels = c(baseline_level, comparison_level)
+        levels = c(group1, group2)
       )
     ) %>%
     droplevels()
@@ -757,9 +754,7 @@ safe_welch_baseline_p <- function(data,
   )
 
   if (length(split_x) < 2) return(NA_real_)
-
   if (any(sapply(split_x, function(v) sum(!is.na(v)) < 2))) return(NA_real_)
-
   if (sd(local_df[[value_col]], na.rm = TRUE) < .Machine$double.eps) return(NA_real_)
 
   tryCatch(
@@ -792,42 +787,66 @@ make_baseline_treatment_analysis <- function(data,
       genotype = factor(genotype, levels = genotype_labels)
     )
 
-  comparison_levels <- setdiff(treatment_labels, baseline_label)
+  comparison_pairs <- tibble::tribble(
+    ~group1,          ~group2,          ~comparison_type,
+    baseline_label,   "+MB\n-PPi",      "Baseline comparison",
+    baseline_label,   "-MB\n+PPi",      "Baseline comparison",
+    baseline_label,   "+MB\n+PPi",      "Baseline comparison",
+    "+MB\n-PPi",      "+MB\n+PPi",      "PPi effect under +MB",
+    "+MB\n+PPi",      "-MB\n+PPi",      "MB effect under +PPi"
+  ) %>%
+    filter(
+      group1 %in% treatment_labels,
+      group2 %in% treatment_labels,
+      group1 != group2
+    ) %>%
+    mutate(
+      comparison = paste0(
+        gsub("\\n", " ", group1),
+        " vs ",
+        gsub("\\n", " ", group2)
+      )
+    )
 
   stat_df <- expand.grid(
     genotype = levels(plot_df$genotype),
-    comparison = comparison_levels,
+    pair_id = seq_len(nrow(comparison_pairs)),
     stringsAsFactors = FALSE
   ) %>%
     as_tibble() %>%
+    left_join(
+      comparison_pairs %>%
+        mutate(pair_id = row_number()),
+      by = "pair_id"
+    ) %>%
     rowwise() %>%
     mutate(
       p_raw = {
         current_genotype <- genotype
 
-        safe_welch_baseline_p(
+        safe_welch_pairwise_p(
           data = plot_df %>% filter(genotype == current_genotype),
           value_col = metric_name,
           group_col = "treatment",
-          baseline_level = baseline_label,
-          comparison_level = comparison
+          group1 = group1,
+          group2 = group2
         )
       },
-      n_baseline = {
+      n_group1 = {
         current_genotype <- genotype
 
         sum(
           plot_df$genotype == current_genotype &
-            plot_df$treatment == baseline_label &
+            plot_df$treatment == group1 &
             !is.na(plot_df[[metric_name]])
         )
       },
-      n_comparison = {
+      n_group2 = {
         current_genotype <- genotype
 
         sum(
           plot_df$genotype == current_genotype &
-            plot_df$treatment == comparison &
+            plot_df$treatment == group2 &
             !is.na(plot_df[[metric_name]])
         )
       }
@@ -839,9 +858,8 @@ make_baseline_treatment_analysis <- function(data,
       p_label = format_p_stars(p_adj_BH),
       p_raw_formatted = format_p_value(p_raw),
       p_adj_BH_formatted = format_p_value(p_adj_BH),
-      comparison_rank = row_number(),
-      x = match(baseline_label, treatment_labels),
-      xend = match(comparison, treatment_labels),
+      x = match(group1, treatment_labels),
+      xend = match(group2, treatment_labels),
       label_x = (x + xend) / 2
     ) %>%
     ungroup() %>%
@@ -861,7 +879,7 @@ make_baseline_treatment_analysis <- function(data,
   stat_plot_df <- stat_df %>%
     left_join(y_positions, by = "genotype") %>%
     group_by(genotype) %>%
-    arrange(xend, .by_group = TRUE) %>%
+    arrange(pair_id, .by_group = TRUE) %>%
     mutate(
       y = y_base * (1.10 + 0.10 * (row_number() - 1)),
       yend = y,
@@ -917,7 +935,7 @@ make_baseline_treatment_analysis <- function(data,
       x = "Treatment",
       y = y_label,
       title = plot_title,
-      subtitle = paste0("Within-genotype comparison against baseline: ", gsub("\\n", " ", baseline_label))
+      subtitle = "Within-genotype treatment comparisons; Welch t-test with BH correction"
     ) +
     theme(
       legend.position = "none",
@@ -929,8 +947,9 @@ make_baseline_treatment_analysis <- function(data,
     plot = plot,
     statistics = stat_df %>%
       select(
-        metric_id, metric, genotype, baseline, comparison,
-        n_baseline, n_comparison,
+        metric_id, metric, genotype, comparison_type,
+        group1, group2, comparison,
+        n_group1, n_group2,
         p_raw, p_adj_BH, p_label,
         p_raw_formatted, p_adj_BH_formatted
       ),
