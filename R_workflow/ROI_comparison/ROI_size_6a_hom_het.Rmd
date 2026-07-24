@@ -1,0 +1,705 @@
+---
+title: "ROI size analysis with mixed-effects modeling"
+author: "SCAMP / RESQ analysis workflow"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## ==========================================================
+## ROI size analysis with mixed-effects modeling
+## ==========================================================
+## Purpose:
+##   Analyse whether fused-region / ROI area is associated with AP-axis
+##   position and whether this relationship differs between genotypes, while
+##   accounting for non-independence of multiple ROIs measured from the same fish.
+##
+## Expected input columns:
+##   fishID, genotype, Area number, Area, AP_axis
+##
+## Main model:
+##   Area ~ genotype * AP_axis_scaled + (1 | fishID)
+##
+## Main outputs:
+##   Results/Figures/
+##   Results/Statistics/
+##   Results/QC/
+## ==========================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readxl)
+  library(lme4)
+  library(lmerTest)
+  library(emmeans)
+})
+
+## -----------------------------
+## User settings
+## -----------------------------
+
+input_file <- "fusion-human-resq.xlsx"
+input_sheet <- 1
+
+results_dir <- "Results"
+fig_dir <- file.path(results_dir, "Figures")
+stats_dir <- file.path(results_dir, "Statistics")
+qc_dir <- file.path(results_dir, "QC")
+
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(stats_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+
+genotype_levels <- c("2_het", "3_mut")
+
+genotype_labels <- c(
+  "2_het" = "abcc6a+/-",
+  "3_mut" = "abcc6a-/-"
+)
+
+genotype_cols <- c(
+  "2_het" = "#261A68",
+  "3_mut" = "#B61515"
+)
+
+## Binning setting for optional AP-axis summary
+bin_width <- 100
+
+## Smoothing parameter for the descriptive LOESS visualization.
+## Larger values produce a smoother curve; smaller values follow local variation
+## more closely. This does not affect the mixed-effects model or its statistics.
+loess_span <- 0.75
+
+## -----------------------------
+## Helper functions
+## -----------------------------
+
+format_p_stars <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "n.c.",
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+format_p_value <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ NA_character_,
+    p < 0.0001 ~ "<0.0001",
+    TRUE ~ formatC(p, format = "f", digits = 4)
+  )
+}
+
+as_numeric_clean <- function(x) {
+  as.numeric(gsub(",", ".", as.character(x)))
+}
+
+write_session_info <- function(path) {
+  sink(path)
+  print(sessionInfo())
+  sink()
+}
+
+export_csv <- function(x, filename) {
+  readr::write_csv(x, file.path(stats_dir, filename))
+}
+
+scamp_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(colour = "black"),
+    legend.title = element_blank()
+  )
+```
+
+# 1. Load and clean data
+
+```{r load-data}
+raw_dat <- read_excel(input_file, sheet = input_sheet)
+
+required_cols <- c("fishID", "genotype", "Area number", "Area", "AP_axis")
+missing_cols <- setdiff(required_cols, names(raw_dat))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required column(s): ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+resq_df <- raw_dat %>%
+  as_tibble() %>%
+  mutate(
+    fishID = factor(fishID),
+    genotype_raw = as.character(genotype),
+    genotype = factor(genotype_raw, levels = genotype_levels),
+    genotype_label = factor(
+      genotype_labels[as.character(genotype)],
+      levels = unname(genotype_labels)
+    ),
+    area_number = factor(`Area number`),
+    Area = as_numeric_clean(Area),
+    AP_axis = as_numeric_clean(AP_axis)
+  ) %>%
+  filter(
+    !is.na(fishID),
+    !is.na(genotype),
+    is.finite(Area),
+    is.finite(AP_axis)
+  )
+
+if (nrow(resq_df) == 0) {
+  stop("No usable rows remained after filtering. Check genotype labels and numeric columns.")
+}
+
+## Scale AP-axis for stable mixed-model fitting while keeping raw AP_axis for plotting.
+ap_axis_center <- mean(resq_df$AP_axis, na.rm = TRUE)
+ap_axis_scale <- sd(resq_df$AP_axis, na.rm = TRUE)
+
+if (!is.finite(ap_axis_scale) || ap_axis_scale == 0) {
+  stop("AP_axis has zero or invalid standard deviation; mixed model cannot be fitted.")
+}
+
+resq_df <- resq_df %>%
+  mutate(
+    AP_axis_scaled = (AP_axis - ap_axis_center) / ap_axis_scale
+  )
+
+export_csv(
+  resq_df,
+  "ROI_cleaned_input_data.csv"
+)
+
+resq_df
+```
+
+# 2. Sample overview
+
+```{r sample-overview}
+region_summary <- resq_df %>%
+  group_by(genotype, genotype_label) %>%
+  summarise(
+    n_regions = n(),
+    n_fish = n_distinct(fishID),
+    mean_regions_per_fish = n_regions / n_fish,
+    mean_area = mean(Area, na.rm = TRUE),
+    median_area = median(Area, na.rm = TRUE),
+    sd_area = sd(Area, na.rm = TRUE),
+    min_area = min(Area, na.rm = TRUE),
+    max_area = max(Area, na.rm = TRUE),
+    mean_AP_axis = mean(AP_axis, na.rm = TRUE),
+    min_AP_axis = min(AP_axis, na.rm = TRUE),
+    max_AP_axis = max(AP_axis, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+fish_summary <- resq_df %>%
+  group_by(fishID, genotype, genotype_label) %>%
+  summarise(
+    n_regions = n(),
+    mean_area = mean(Area, na.rm = TRUE),
+    median_area = median(Area, na.rm = TRUE),
+    total_area = sum(Area, na.rm = TRUE),
+    mean_AP_axis = mean(AP_axis, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+export_csv(region_summary, "ROI_region_level_summary_by_genotype.csv")
+export_csv(fish_summary, "ROI_fish_level_summary.csv")
+
+region_summary
+fish_summary
+```
+
+# 3. Mixed-effects model
+
+Multiple ROIs may originate from the same fish. Therefore, ROI-level measurements are analysed using a linear mixed-effects model with fish identity as a random intercept. This accounts for within-fish clustering and avoids treating all ROIs as fully independent observations.
+
+```{r mixed-model}
+roi_lmer <- lmerTest::lmer(
+  Area ~ genotype * AP_axis_scaled + (1 | fishID),
+  data = resq_df,
+  REML = FALSE
+)
+
+model_formula <- tibble(
+  model = "Area ~ genotype * AP_axis_scaled + (1 | fishID)",
+  note = "AP_axis was scaled before model fitting; fishID was included as a random intercept."
+)
+
+export_csv(model_formula, "ROI_mixed_model_formula.csv")
+
+roi_lmer
+```
+
+# 4. Mixed-model statistics
+
+```{r mixed-model-statistics}
+## Type III ANOVA table from lmerTest. This tests the genotype effect,
+## the AP-axis effect, and their interaction while accounting for fishID.
+lmer_anova <- as.data.frame(anova(roi_lmer, type = 3)) %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble() %>%
+  mutate(
+    p_label = format_p_stars(`Pr(>F)`),
+    p_formatted = format_p_value(`Pr(>F)`)
+  )
+
+## Fixed-effect coefficient table without broom.mixed.
+coef_table <- as.data.frame(summary(roi_lmer)$coefficients) %>%
+  tibble::rownames_to_column("term") %>%
+  as_tibble()
+
+names(coef_table)[names(coef_table) == "Estimate"] <- "estimate"
+names(coef_table)[names(coef_table) == "Std. Error"] <- "std_error"
+names(coef_table)[names(coef_table) == "df"] <- "df"
+names(coef_table)[names(coef_table) == "t value"] <- "t_value"
+names(coef_table)[names(coef_table) == "Pr(>|t|)"] <- "p_value"
+
+coef_table <- coef_table %>%
+  mutate(
+    p_label = format_p_stars(p_value),
+    p_formatted = format_p_value(p_value)
+  )
+
+## Random-effect variance components.
+random_effects <- as.data.frame(VarCorr(roi_lmer)) %>%
+  as_tibble()
+
+## Model fit statistics.
+model_fit <- tibble(
+  AIC = AIC(roi_lmer),
+  BIC = BIC(roi_lmer),
+  logLik = as.numeric(logLik(roi_lmer)),
+  deviance = deviance(roi_lmer),
+  n_observations = nobs(roi_lmer),
+  n_fish = n_distinct(resq_df$fishID)
+)
+
+export_csv(lmer_anova, "ROI_mixed_model_typeIII_ANOVA.csv")
+export_csv(coef_table, "ROI_mixed_model_fixed_effects.csv")
+export_csv(random_effects, "ROI_mixed_model_random_effects.csv")
+export_csv(model_fit, "ROI_mixed_model_fit_statistics.csv")
+
+lmer_anova
+coef_table
+random_effects
+model_fit
+```
+
+# 5. Genotype-specific AP-axis slopes
+
+The interaction term tests whether the relationship between ROI area and AP-axis position differs between genotypes. Estimated AP-axis slopes within each genotype and their pairwise comparison are exported below.
+
+```{r emtrends}
+ap_trends <- emmeans::emtrends(
+  roi_lmer,
+  specs = ~ genotype,
+  var = "AP_axis_scaled"
+)
+
+ap_trends_df <- as.data.frame(
+  summary(ap_trends, infer = c(TRUE, TRUE))
+) %>%
+  as_tibble() %>%
+  mutate(
+    genotype_label = genotype_labels[as.character(genotype)],
+    p_label = format_p_stars(p.value),
+    p_formatted = format_p_value(p.value)
+  )
+
+ap_trend_comparison <- as.data.frame(
+  summary(pairs(ap_trends), infer = c(TRUE, TRUE), adjust = "none")
+) %>%
+  as_tibble() %>%
+  mutate(
+    p_label = format_p_stars(p.value),
+    p_formatted = format_p_value(p.value)
+  )
+
+export_csv(ap_trends_df, "ROI_estimated_AP_axis_slopes_by_genotype.csv")
+export_csv(ap_trend_comparison, "ROI_AP_axis_slope_comparison_between_genotypes.csv")
+
+ap_trends_df
+ap_trend_comparison
+```
+
+# 6. Mixed-model prediction plot
+
+```{r prediction-data}
+pred_grid <- expand.grid(
+  AP_axis = seq(
+    min(resq_df$AP_axis, na.rm = TRUE),
+    max(resq_df$AP_axis, na.rm = TRUE),
+    length.out = 200
+  ),
+  genotype = genotype_levels,
+  KEEP.OUT.ATTRS = FALSE,
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble() %>%
+  mutate(
+    genotype = factor(genotype, levels = genotype_levels),
+    AP_axis_scaled = (AP_axis - ap_axis_center) / ap_axis_scale
+  )
+
+## Fixed-effect prediction and confidence interval calculated manually from
+## the model matrix and fixed-effect variance-covariance matrix.
+X <- model.matrix(
+  ~ genotype * AP_axis_scaled,
+  pred_grid
+)
+
+beta <- fixef(roi_lmer)
+X <- X[, names(beta), drop = FALSE]
+V <- as.matrix(vcov(roi_lmer))
+
+pred_grid$fit <- as.numeric(X %*% beta)
+pred_grid$se <- sqrt(diag(X %*% V %*% t(X)))
+pred_grid <- pred_grid %>%
+  mutate(
+    lower = fit - 1.96 * se,
+    upper = fit + 1.96 * se
+  )
+
+export_csv(pred_grid, "ROI_mixed_model_prediction_grid.csv")
+```
+
+```{r mixed-model-plot, fig.width=10, fig.height=4}
+p_mixed_model <- ggplot(
+  resq_df,
+  aes(
+    x = AP_axis,
+    y = Area,
+    colour = genotype,
+    fill = genotype
+  )
+) +
+  geom_point(
+    alpha = 0.65,
+    size = 2
+  ) +
+  geom_ribbon(
+    data = pred_grid,
+    aes(
+      x = AP_axis,
+      ymin = lower,
+      ymax = upper,
+      fill = genotype
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.18,
+    colour = NA
+  ) +
+  geom_line(
+    data = pred_grid,
+    aes(
+      x = AP_axis,
+      y = fit,
+      colour = genotype
+    ),
+    inherit.aes = FALSE,
+    linewidth = 1
+  ) +
+  scale_colour_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scale_fill_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scamp_theme +
+  labs(
+    x = "AP-axis position",
+    y = "Fused region area",
+    title = "Fused region size along the AP axis",
+    subtitle = "Linear mixed-effects model: Area ~ genotype × AP-axis + (1 | fishID)",
+    colour = "Genotype",
+    fill = "Genotype"
+  )
+
+p_mixed_model
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_mixed_model_AP_axis_area.pdf"),
+  plot = p_mixed_model,
+  width = 10,
+  height = 4,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_mixed_model_AP_axis_area.png"),
+  plot = p_mixed_model,
+  width = 10,
+  height = 4,
+  dpi = 600
+)
+```
+
+# 7. Fish-level summary plot
+
+This plot summarizes each fish as one data point. It is not the primary inferential model, but it is useful for checking whether ROI-level results are driven by a small number of individuals.
+
+```{r fish-level-plot, fig.width=6, fig.height=4}
+p_fish_summary <- ggplot(
+  fish_summary,
+  aes(
+    x = genotype,
+    y = mean_area,
+    fill = genotype,
+    colour = genotype
+  )
+) +
+  geom_boxplot(
+    width = 0.45,
+    alpha = 0.35,
+    linewidth = 0.7,
+    outlier.shape = NA
+  ) +
+  geom_jitter(
+    width = 0.10,
+    size = 2.4,
+    alpha = 0.85
+  ) +
+  scale_fill_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scale_colour_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scale_x_discrete(labels = genotype_labels) +
+  scamp_theme +
+  labs(
+    x = "Genotype",
+    y = "Mean fused region area per fish",
+    title = "Fish-level mean fused region area"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+p_fish_summary
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_fish_level_mean_area.pdf"),
+  plot = p_fish_summary,
+  width = 6,
+  height = 4,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_fish_level_mean_area.png"),
+  plot = p_fish_summary,
+  width = 6,
+  height = 4,
+  dpi = 600
+)
+```
+
+# 8. Binned AP-axis visualization
+
+Because AP-axis position is near-continuous, exact-position groups often contain only one observation. For visualization only, AP-axis position is binned. Statistical inference should be based on the mixed-effects model above, not on the binned plot.
+
+```{r binned-summary}
+ap_min <- floor(min(resq_df$AP_axis, na.rm = TRUE) / bin_width) * bin_width
+ap_max <- ceiling(max(resq_df$AP_axis, na.rm = TRUE) / bin_width) * bin_width + bin_width
+
+resq_binned <- resq_df %>%
+  mutate(
+    AP_bin = cut(
+      AP_axis,
+      breaks = seq(ap_min, ap_max, by = bin_width),
+      include.lowest = TRUE,
+      right = FALSE
+    ),
+    AP_bin_mid = as.numeric(sub("\\[(.*),(.*)\\)", "\\1", AP_bin)) + bin_width / 2
+  )
+
+summary_binned <- resq_binned %>%
+  group_by(genotype, genotype_label, AP_bin, AP_bin_mid) %>%
+  summarise(
+    n_regions = n(),
+    n_fish = n_distinct(fishID),
+    mean_area = mean(Area, na.rm = TRUE),
+    sd_area = if_else(n_regions > 1, sd(Area, na.rm = TRUE), NA_real_),
+    se_area = if_else(n_regions > 1, sd_area / sqrt(n_regions), NA_real_),
+    ymin = mean_area - se_area,
+    ymax = mean_area + se_area,
+    .groups = "drop"
+  )
+
+export_csv(
+  summary_binned,
+  "ROI_binned_AP_axis_summary.csv"
+)
+
+summary_binned
+```
+
+```{r binned-plot, fig.width=10, fig.height=4}
+p_binned <- ggplot() +
+  geom_point(
+    data = resq_df,
+    aes(
+      x = AP_axis,
+      y = Area,
+      colour = genotype
+    ),
+    alpha = 0.30,
+    size = 1.8
+  ) +
+  geom_line(
+    data = summary_binned,
+    aes(
+      x = AP_bin_mid,
+      y = mean_area,
+      colour = genotype,
+      group = genotype
+    ),
+    linewidth = 1
+  ) +
+  geom_point(
+    data = summary_binned,
+    aes(
+      x = AP_bin_mid,
+      y = mean_area,
+      colour = genotype
+    ),
+    size = 3
+  ) +
+  geom_errorbar(
+    data = summary_binned %>% filter(!is.na(se_area)),
+    aes(
+      x = AP_bin_mid,
+      ymin = ymin,
+      ymax = ymax,
+      colour = genotype
+    ),
+    width = bin_width * 0.15,
+    linewidth = 0.8
+  ) +
+  scale_colour_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scamp_theme +
+  labs(
+    x = paste0("AP-axis position, binned every ", bin_width, " units"),
+    y = "Fused region area",
+    title = "Binned fused-region size along the AP axis",
+    colour = "Genotype"
+  )
+
+p_binned
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_binned_AP_axis_mean_SE.pdf"),
+  plot = p_binned,
+  width = 10,
+  height = 4,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_binned_AP_axis_mean_SE.png"),
+  plot = p_binned,
+  width = 10,
+  height = 4,
+  dpi = 600
+)
+```
+
+# 9. Descriptive LOESS visualization
+
+The curves below are descriptive LOESS smooths intended to show the potentially
+non-linear pattern of the observations. They are not predictions from the
+linear mixed-effects model and are not used for statistical inference. All
+reported tests, effect estimates, and genotype-specific AP-axis slopes remain
+based on the mixed-effects model in Sections 3--5.
+
+The shaded bands are the pointwise 95% confidence bands returned by the LOESS
+smoother. Because this descriptive smoother does not model the clustering of
+ROIs within fish, inferential conclusions should not be drawn from the LOESS
+bands.
+
+```{r loess-plot, fig.width=10, fig.height=4}
+p_loess <- ggplot(
+  resq_df,
+  aes(
+    x = AP_axis,
+    y = Area,
+    colour = genotype,
+    fill = genotype
+  )
+) +
+  geom_point(
+    alpha = 0.35,
+    size = 1.8
+  ) +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    span = loess_span,
+    se = TRUE,
+    level = 0.95,
+    linewidth = 1
+  ) +
+  scale_colour_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scale_fill_manual(
+    values = genotype_cols,
+    labels = genotype_labels
+  ) +
+  scamp_theme +
+  labs(
+    x = "AP-axis position",
+    y = "Fused region area",
+    title = "Fused region size along the AP axis",
+    subtitle = paste0(
+      "Descriptive LOESS curves (span = ", loess_span,
+      "); inference is based on the linear mixed-effects model"
+    ),
+    colour = "Genotype",
+    fill = "Genotype"
+  )
+
+p_loess
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_LOESS_AP_axis_area.pdf"),
+  plot = p_loess,
+  width = 10,
+  height = 4,
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(fig_dir, "ROI_LOESS_AP_axis_area.png"),
+  plot = p_loess,
+  width = 10,
+  height = 4,
+  dpi = 600
+)
+```
+
+# 10. Save session information
+
+```{r session-info}
+write_session_info(
+  file.path(qc_dir, "ROI_mixed_model_sessionInfo.txt")
+)
+```

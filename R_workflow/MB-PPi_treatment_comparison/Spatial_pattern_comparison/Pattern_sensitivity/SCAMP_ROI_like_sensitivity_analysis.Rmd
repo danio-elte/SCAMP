@@ -1,0 +1,843 @@
+---
+title: "SCAMP ROI-like spatial analysis: threshold sensitivity"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## ================================================================
+## SCAMP ROI-like spatial analysis: threshold sensitivity
+## ---------------------------------------------------------------
+## Input expected in the working directory:
+##   MB_PPi_data_combined.csv
+##
+## Reference analysis:
+##   treatment-specific thresholds, 60% lower tail + 3 scaled MAD
+##
+## Sensitivity grid:
+##   threshold grouping: experiment-wide / treatment-specific
+##   lower-tail quantile: 50% / 60% / 70%
+##   MAD multiplier: 2 / 3 / 4
+##
+## This notebook evaluates relative spatial-pattern conclusions only.
+## It must not be used for absolute fluorescence or positive-area inference.
+## ================================================================
+
+required_packages <- c(
+  "tidyverse",
+  "patchwork",
+  "knitr",
+  "lmerTest",
+  "emmeans"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this notebook."
+  )
+}
+
+library(tidyverse)
+library(patchwork)
+library(knitr)
+library(lmerTest)
+library(emmeans)
+
+options(contrasts = c("contr.sum", "contr.poly"))
+
+## -----------------------------
+## Paths and output directories
+## -----------------------------
+
+analysis_root <- normalizePath(
+  getwd(),
+  winslash = "/",
+  mustWork = TRUE
+)
+
+scamp_data_path <- file.path(analysis_root, "MB_PPi_data_combined.csv")
+
+output_dir <- file.path(
+  analysis_root,
+  "Results",
+  "ROI_like_sensitivity_analysis_S5_only"
+)
+figure_dir <- file.path(output_dir, "Figures")
+statistics_dir <- file.path(output_dir, "Statistics")
+qc_dir <- file.path(output_dir, "QC")
+
+ensure_output_dirs <- function() {
+  output_directories <- c(
+    output_dir,
+    figure_dir,
+    statistics_dir,
+    qc_dir
+  )
+
+  for (current_directory in output_directories) {
+    if (!dir.exists(current_directory)) {
+      dir.create(
+        current_directory,
+        recursive = TRUE,
+        showWarnings = FALSE
+      )
+    }
+  }
+
+  missing_directories <- output_directories[
+    !vapply(output_directories, dir.exists, logical(1))
+  ]
+
+  if (length(missing_directories) > 0) {
+    stop(
+      "Could not create output directorie(s): ",
+      paste(missing_directories, collapse = ", ")
+    )
+  }
+
+  invisible(output_directories)
+}
+
+ensure_output_dirs()
+
+## -----------------------------
+## Analysis settings
+## -----------------------------
+
+target_length <- 1000L
+fixed_columns <- 4L
+reference_scenario <- "treatment__Q60_MAD3"
+
+genotype_labels <- c(
+  "2_het" = "abcc6a+/-",
+  "3_mut" = "abcc6a-/-"
+)
+
+treatment_labels <- c(
+  "_-PPi_-MB" = "-MB\n-PPi",
+  "_-PPi_+MB" = "+MB\n-PPi",
+  "_+PPi_-MB" = "-MB\n+PPi",
+  "_+PPi_+MB" = "+MB\n+PPi"
+)
+
+mb_map <- c(
+  "_-PPi_-MB" = "-MB",
+  "_-PPi_+MB" = "+MB",
+  "_+PPi_-MB" = "-MB",
+  "_+PPi_+MB" = "+MB"
+)
+
+ppi_map <- c(
+  "_-PPi_-MB" = "-PPi",
+  "_-PPi_+MB" = "-PPi",
+  "_+PPi_-MB" = "+PPi",
+  "_+PPi_+MB" = "+PPi"
+)
+
+scheme_labels <- c(
+  "experiment" = "Experiment-wide",
+  "treatment" = "Treatment-specific"
+)
+
+scamp_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(colour = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.title = element_blank()
+  )
+```
+
+# 1. Helper functions
+
+```{r helper-functions}
+normalize_row <- function(row, target_length = 1000L) {
+  row <- as.numeric(row)
+  valid <- which(is.finite(row))
+
+  if (length(valid) == 0) return(rep(NA_real_, target_length))
+
+  row <- row[min(valid):max(valid)]
+
+  if (length(row) == 1) return(rep(row, target_length))
+
+  approx(
+    x = seq(0, 1, length.out = length(row)),
+    y = row,
+    xout = seq(0, 1, length.out = target_length),
+    rule = 2
+  )$y
+}
+
+estimate_positive_threshold <- function(pixel_matrix,
+                                        background_quantile,
+                                        multiplier) {
+  values <- as.numeric(pixel_matrix)
+  values <- values[is.finite(values) & values >= 0]
+
+  cutoff <- unname(quantile(
+    values,
+    probs = background_quantile,
+    names = FALSE,
+    na.rm = TRUE,
+    type = 7
+  ))
+
+  background_values <- values[values <= cutoff]
+  baseline <- median(background_values, na.rm = TRUE)
+  noise_mad <- mad(
+    background_values,
+    center = baseline,
+    constant = 1.4826,
+    na.rm = TRUE
+  )
+
+  tibble(
+    threshold = baseline + multiplier * noise_mad,
+    baseline = baseline,
+    noise_mad = noise_mad,
+    lower_tail_cutoff = cutoff
+  )
+}
+
+extract_positive_regions <- function(binary_profile) {
+  binary_profile[is.na(binary_profile)] <- FALSE
+  runs <- rle(binary_profile)
+  run_ends <- cumsum(runs$lengths)
+  run_starts <- run_ends - runs$lengths + 1L
+  positive_runs <- which(runs$values)
+
+  if (length(positive_runs) == 0) return(tibble())
+
+  tibble(
+    region_id = seq_along(positive_runs),
+    start_index = run_starts[positive_runs],
+    end_index = run_ends[positive_runs],
+    region_length = runs$lengths[positive_runs],
+    centroid_index = (run_starts[positive_runs] + run_ends[positive_runs]) / 2,
+    AP_position_percent =
+      ((centroid_index - 1) / (length(binary_profile) - 1)) * 100,
+    relative_region_length_percent =
+      (region_length / length(binary_profile)) * 100
+  )
+}
+
+format_p_value <- function(p) {
+  ifelse(is.na(p), NA_character_, formatC(p, format = "e", digits = 3))
+}
+
+format_p_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "n.c.",
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+make_threshold_groups <- function(meta, scheme) {
+  switch(
+    scheme,
+    "experiment" = rep("all", nrow(meta)),
+    "treatment" = as.character(meta$treatment),
+    stop("Unknown threshold-grouping scheme: ", scheme)
+  )
+}
+```
+
+# 2. Load and normalize SCAMP profiles
+
+```{r load-and-normalize-data}
+if (!file.exists(scamp_data_path)) {
+  stop("SCAMP input file not found: ", scamp_data_path)
+}
+
+scamp_raw <- read.csv2(
+  scamp_data_path,
+  header = TRUE,
+  check.names = FALSE
+)
+
+if (ncol(scamp_raw) <= fixed_columns) {
+  stop("No fluorescence-profile columns found after the first four metadata columns.")
+}
+
+pixel_data <- t(apply(
+  scamp_raw[, (fixed_columns + 1):ncol(scamp_raw), drop = FALSE],
+  1,
+  normalize_row,
+  target_length = target_length
+))
+
+storage.mode(pixel_data) <- "numeric"
+colnames(pixel_data) <- paste0("P", seq_len(target_length))
+
+meta <- tibble(
+  fish = make.unique(as.character(scamp_raw[[1]])),
+  treatment_raw = as.character(scamp_raw[[2]]),
+  genotype_raw = as.character(scamp_raw[[4]])
+) %>%
+  mutate(
+    genotype = factor(
+      genotype_raw,
+      levels = names(genotype_labels),
+      labels = genotype_labels
+    ),
+    treatment = factor(
+      unname(treatment_labels[treatment_raw]),
+      levels = unname(treatment_labels)
+    ),
+    MB = factor(
+      unname(mb_map[treatment_raw]),
+      levels = c("-MB", "+MB")
+    ),
+    PPi = factor(
+      unname(ppi_map[treatment_raw]),
+      levels = c("-PPi", "+PPi")
+    )
+  )
+
+keep <- complete.cases(meta[, c("genotype", "treatment", "MB", "PPi")])
+meta <- meta[keep, ]
+pixel_data <- pixel_data[keep, , drop = FALSE]
+
+kable(
+  meta %>% count(genotype, MB, PPi),
+  caption = "Specimen numbers by genotype and treatment"
+)
+```
+
+# 3. Define sensitivity scenarios
+
+```{r sensitivity-scenarios}
+ensure_output_dirs()
+
+scenario_table <- tidyr::expand_grid(
+  scheme = c("experiment", "treatment"),
+  background_quantile = c(0.50, 0.60, 0.70),
+  mad_multiplier = c(2, 3, 4)
+) %>%
+  mutate(
+    specification = paste0(
+      "Q",
+      background_quantile * 100,
+      "_MAD",
+      mad_multiplier
+    ),
+    scenario_id = paste(scheme, specification, sep = "__"),
+    reference = scenario_id == reference_scenario,
+    scheme_label = unname(scheme_labels[scheme])
+  )
+
+if (nrow(scenario_table) != 18L ||
+    !setequal(unique(scenario_table$scheme), c("experiment", "treatment"))) {
+  stop("The S5 sensitivity grid must contain exactly 18 experiment/treatment scenarios.")
+}
+
+write.csv2(
+  scenario_table,
+  file.path(qc_dir, "ROI_like_sensitivity_scenarios.csv"),
+  row.names = FALSE
+)
+
+kable(
+  scenario_table,
+  caption = "Threshold sensitivity scenarios"
+)
+```
+
+# 4. Scenario analysis function
+
+```{r scenario-analysis-function}
+analyse_scenario <- function(scenario_row) {
+  scenario_id <- scenario_row$scenario_id[[1]]
+  scheme <- scenario_row$scheme[[1]]
+  background_quantile <- scenario_row$background_quantile[[1]]
+  mad_multiplier <- scenario_row$mad_multiplier[[1]]
+
+  threshold_group <- make_threshold_groups(meta, scheme)
+
+  threshold_table <- map_dfr(unique(threshold_group), function(current_group) {
+    specimen_index <- which(threshold_group == current_group)
+
+    estimate_positive_threshold(
+      pixel_data[specimen_index, , drop = FALSE],
+      background_quantile = background_quantile,
+      multiplier = mad_multiplier
+    ) %>%
+      mutate(
+        scenario_id = scenario_id,
+        scheme = scheme,
+        background_quantile = background_quantile,
+        mad_multiplier = mad_multiplier,
+        threshold_group = current_group,
+        n_fish = length(specimen_index),
+        .before = 1
+      )
+  })
+
+  specimen_threshold <- threshold_table$threshold[
+    match(threshold_group, threshold_table$threshold_group)
+  ]
+
+  binary_profiles <- sweep(
+    pixel_data,
+    MARGIN = 1,
+    STATS = specimen_threshold,
+    FUN = ">"
+  )
+  colnames(binary_profiles) <- paste0("P", seq_len(ncol(binary_profiles)))
+
+  regions <- map_dfr(seq_len(nrow(meta)), function(i) {
+    extract_positive_regions(binary_profiles[i, ]) %>%
+      mutate(
+        scenario_id = scenario_id,
+        fish = meta$fish[i],
+        genotype = meta$genotype[i],
+        treatment = meta$treatment[i],
+        MB = meta$MB[i],
+        PPi = meta$PPi[i],
+        .before = 1
+      )
+  })
+
+  if (nrow(regions) == 0 || sd(regions$AP_position_percent) == 0) {
+    stop("No usable spatial regions in scenario ", scenario_id)
+  }
+
+  AP_mean <- mean(regions$AP_position_percent, na.rm = TRUE)
+  AP_sd <- sd(regions$AP_position_percent, na.rm = TRUE)
+
+  regions <- regions %>%
+    mutate(AP_position_scaled = (AP_position_percent - AP_mean) / AP_sd)
+
+  region_length_model <- lmerTest::lmer(
+    relative_region_length_percent ~
+      genotype * MB * PPi * AP_position_scaled +
+      (1 | fish),
+    data = regions,
+    REML = FALSE
+  )
+
+  region_length_type3 <- anova(
+    region_length_model,
+    type = 3,
+    ddf = "Satterthwaite"
+  ) %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("term") %>%
+    mutate(
+      scenario_id = scenario_id,
+      p_value = `Pr(>F)`,
+      significance = format_p_stars(p_value),
+      .before = 1
+    )
+
+  region_slopes <- emmeans::emtrends(
+    region_length_model,
+    specs = ~ genotype * MB * PPi,
+    var = "AP_position_scaled"
+  )
+
+  slopes_table <- as.data.frame(
+    summary(region_slopes, infer = c(TRUE, TRUE))
+  ) %>%
+    mutate(scenario_id = scenario_id, .before = 1)
+
+  ppi_contrasts <- contrast(
+    region_slopes,
+    method = "revpairwise",
+    by = c("genotype", "MB"),
+    adjust = "none"
+  )
+
+  ppi_contrasts_table <- as.data.frame(
+    summary(ppi_contrasts, infer = c(TRUE, TRUE))
+  ) %>%
+    mutate(
+      scenario_id = scenario_id,
+      p_value_raw = p.value,
+      p_value_BH = p.adjust(p.value, method = "BH"),
+      significant_BH = p_value_BH < 0.05,
+      direction = case_when(
+        estimate > 0 ~ "positive",
+        estimate < 0 ~ "negative",
+        TRUE ~ "zero"
+      ),
+      .before = 1
+    )
+
+  list(
+    thresholds = threshold_table,
+    regions = regions,
+    region_length_type3 = region_length_type3,
+    slopes = slopes_table,
+    ppi_slope_contrasts = ppi_contrasts_table
+  )
+}
+```
+
+# 5. Run all sensitivity scenarios
+
+```{r run-sensitivity-scenarios}
+ensure_output_dirs()
+
+scenario_results <- vector("list", nrow(scenario_table))
+scenario_errors <- vector("list", nrow(scenario_table))
+
+for (i in seq_len(nrow(scenario_table))) {
+  current_scenario <- scenario_table[i, , drop = FALSE]
+
+  scenario_results[[i]] <- tryCatch(
+    analyse_scenario(current_scenario),
+    error = function(e) {
+      scenario_errors[[i]] <<- tibble(
+        scenario_id = current_scenario$scenario_id,
+        error_message = conditionMessage(e)
+      )
+      NULL
+    }
+  )
+}
+
+successful_results <- scenario_results[!vapply(
+  scenario_results,
+  is.null,
+  logical(1)
+)]
+
+error_table <- bind_rows(scenario_errors)
+
+if (nrow(error_table) == 0) {
+  error_table <- tibble(
+    scenario_id = character(),
+    error_message = character()
+  )
+}
+
+if (length(successful_results) == 0) {
+  stop("All sensitivity scenarios failed. See the error table.")
+}
+
+all_thresholds <- map_dfr(successful_results, "thresholds")
+all_region_length_type3 <- map_dfr(successful_results, "region_length_type3")
+all_slopes <- map_dfr(successful_results, "slopes")
+all_ppi_slope_contrasts <- map_dfr(successful_results, "ppi_slope_contrasts")
+
+write.csv2(
+  error_table,
+  file.path(qc_dir, "ROI_like_sensitivity_model_errors.csv"),
+  row.names = FALSE
+)
+
+kable(
+  tibble(
+    requested_scenarios = nrow(scenario_table),
+    successful_scenarios = length(successful_results),
+    failed_scenarios = nrow(error_table)
+  ),
+  caption = "Sensitivity analysis completion summary"
+)
+```
+
+# 6. Stability relative to the reference analysis
+
+```{r reference-stability}
+ensure_output_dirs()
+
+reference_region_terms <- all_region_length_type3 %>%
+  filter(scenario_id == reference_scenario) %>%
+  select(
+    term,
+    reference_p_value = p_value,
+    reference_significant = significance
+  )
+
+region_term_stability <- all_region_length_type3 %>%
+  left_join(reference_region_terms, by = "term") %>%
+  mutate(
+    significant = p_value < 0.05,
+    reference_significant_logical = reference_p_value < 0.05,
+    same_significance = significant == reference_significant_logical
+  ) %>%
+  left_join(
+    scenario_table %>% select(scenario_id, scheme, specification, reference),
+    by = "scenario_id"
+  )
+
+reference_ppi_contrasts <- all_ppi_slope_contrasts %>%
+  filter(scenario_id == reference_scenario) %>%
+  select(
+    genotype,
+    MB,
+    reference_estimate = estimate,
+    reference_p_BH = p_value_BH,
+    reference_direction = direction,
+    reference_significant_BH = significant_BH
+  )
+
+ppi_contrast_stability <- all_ppi_slope_contrasts %>%
+  left_join(
+    reference_ppi_contrasts,
+    by = c("genotype", "MB")
+  ) %>%
+  mutate(
+    same_direction = direction == reference_direction,
+    same_significance = significant_BH == reference_significant_BH
+  ) %>%
+  left_join(
+    scenario_table %>% select(scenario_id, scheme, specification, reference),
+    by = "scenario_id"
+  )
+
+key_region_terms <- c(
+  "genotype:PPi",
+  "PPi:AP_position_scaled",
+  "genotype:PPi:AP_position_scaled"
+)
+
+key_region_term_summary <- region_term_stability %>%
+  filter(term %in% key_region_terms) %>%
+  group_by(term, scheme) %>%
+  summarise(
+    scenarios = n(),
+    significant_scenarios = sum(significant, na.rm = TRUE),
+    significance_agreement = mean(same_significance, na.rm = TRUE),
+    min_p = min(p_value, na.rm = TRUE),
+    max_p = max(p_value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ppi_contrast_summary <- ppi_contrast_stability %>%
+  group_by(genotype, MB, scheme) %>%
+  summarise(
+    scenarios = n(),
+    same_direction = mean(same_direction, na.rm = TRUE),
+    significance_agreement = mean(same_significance, na.rm = TRUE),
+    significant_scenarios = sum(significant_BH, na.rm = TRUE),
+    min_estimate = min(estimate, na.rm = TRUE),
+    max_estimate = max(estimate, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv2(
+  region_term_stability,
+  file.path(statistics_dir, "ROI_like_region_length_term_stability.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  ppi_contrast_stability,
+  file.path(statistics_dir, "ROI_like_PPi_slope_contrast_stability.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  key_region_term_summary,
+  file.path(statistics_dir, "ROI_like_key_spatial_conclusion_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  ppi_contrast_summary,
+  file.path(statistics_dir, "ROI_like_PPi_slope_contrast_summary.csv"),
+  row.names = FALSE
+)
+
+kable(
+  key_region_term_summary,
+  digits = 4,
+  caption = "Stability of the key region-length interaction terms"
+)
+
+kable(
+  ppi_contrast_summary,
+  digits = 4,
+  caption = "Stability of PPi effects on AP-axis slopes"
+)
+```
+
+# 7. Complete result export
+
+```{r complete-result-export}
+ensure_output_dirs()
+
+write.csv2(
+  all_thresholds,
+  file.path(qc_dir, "ROI_like_all_sensitivity_thresholds.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  all_region_length_type3,
+  file.path(statistics_dir, "ROI_like_all_region_length_TypeIII_results.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  all_slopes,
+  file.path(statistics_dir, "ROI_like_all_AP_axis_slopes.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  all_ppi_slope_contrasts,
+  file.path(statistics_dir, "ROI_like_all_PPi_slope_contrasts.csv"),
+  row.names = FALSE
+)
+
+```
+
+# 8. Sensitivity visualizations
+
+```{r sensitivity-visualizations, fig.width=12, fig.height=8}
+plot_region_terms <- region_term_stability %>%
+  filter(term %in% key_region_terms) %>%
+  mutate(
+    scheme = factor(scheme, levels = names(scheme_labels), labels = scheme_labels),
+    specification = factor(
+      specification,
+      levels = scenario_table %>%
+        arrange(background_quantile, mad_multiplier) %>%
+        distinct(specification) %>%
+        pull(specification)
+    )
+  )
+
+p_term_stability <- ggplot(
+  plot_region_terms,
+  aes(x = specification, y = -log10(p_value), colour = term, group = term)
+) +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, colour = "grey40") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2) +
+  facet_wrap(~ scheme, ncol = 1, scales = "free_x") +
+  scamp_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = "Threshold specification",
+    y = expression(-log[10](p)),
+    title = "Stability of key spatial interaction terms"
+  )
+
+plot_ppi_contrasts <- ppi_contrast_stability %>%
+  mutate(
+    scheme = factor(scheme, levels = names(scheme_labels), labels = scheme_labels),
+    specification = factor(
+      specification,
+      levels = scenario_table %>%
+        arrange(background_quantile, mad_multiplier) %>%
+        distinct(specification) %>%
+        pull(specification)
+    )
+  )
+
+p_ppi_contrast_stability <- ggplot(
+  plot_ppi_contrasts,
+  aes(
+    x = specification,
+    y = estimate,
+    colour = genotype,
+    group = genotype
+  )
+) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey40") +
+  geom_line(linewidth = 0.7) +
+  geom_point(aes(shape = significant_BH), size = 2.2) +
+  facet_grid(MB ~ scheme, scales = "free_x") +
+  scamp_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    x = "Threshold specification",
+    y = "PPi effect on AP-axis slope (+PPi minus -PPi)",
+    title = "Stability of PPi slope contrasts"
+  )
+
+p_term_stability
+p_ppi_contrast_stability
+```
+
+# 9. Figure export
+
+```{r figure-export}
+ensure_output_dirs()
+
+combined_sensitivity_figure <-
+  p_term_stability /
+  p_ppi_contrast_stability +
+  plot_annotation(tag_levels = "A")
+
+ggsave(
+  file.path(figure_dir, "ROI_like_key_term_sensitivity.pdf"),
+  p_term_stability,
+  width = 12,
+  height = 9,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_key_term_sensitivity.png"),
+  p_term_stability,
+  width = 12,
+  height = 9,
+  dpi = 600
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_PPi_slope_contrast_sensitivity.pdf"),
+  p_ppi_contrast_stability,
+  width = 12,
+  height = 7,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_PPi_slope_contrast_sensitivity.png"),
+  p_ppi_contrast_stability,
+  width = 12,
+  height = 7,
+  dpi = 600
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_sensitivity_combined.pdf"),
+  combined_sensitivity_figure,
+  width = 12,
+  height = 16,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_sensitivity_combined.png"),
+  combined_sensitivity_figure,
+  width = 12,
+  height = 16,
+  dpi = 600
+)
+
+combined_sensitivity_figure
+```
+
+# 10. Session information
+
+```{r session-information}
+ensure_output_dirs()
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(qc_dir, "sessionInfo.txt")
+)
+
+sessionInfo()
+```

@@ -1,0 +1,833 @@
+---
+title: "SCAMP hom/het validation mineralization analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## ================================================================
+## SCAMP hom/het validation mineralization analysis
+## ---------------------------------------------------------------
+## Inputs expected in the working directory by default:
+##   1) COMBINED_PIXEL_DATA_SCAMP_output.csv
+##      SCAMP pixel-profile matrix, semicolon-delimited.
+##      Expected fixed columns: image_name/fish, genotype,
+##      followed by pixel columns.
+##
+## Outputs are written to Results/Figures, Results/Statistics,
+## and Results/QC.
+## ================================================================
+
+required_packages <- c(
+  "tidyverse",
+  "ComplexHeatmap",
+  "circlize",
+  "matrixStats",
+  "grid",
+  "patchwork",
+  "knitr",
+  "car"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this notebook."
+  )
+}
+
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(matrixStats)
+library(grid)
+library(patchwork)
+library(knitr)
+library(car)
+
+## -----------------------------
+## User-editable input path
+## -----------------------------
+
+scamp_data_path <- "COMBINED_PIXEL_DATA_SCAMP_output.csv"
+
+output_dir <- "Results"
+figure_dir <- file.path(output_dir, "Figures")
+statistics_dir <- file.path(output_dir, "Statistics")
+qc_dir <- file.path(output_dir, "QC")
+
+dir.create(figure_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(statistics_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+
+## -----------------------------
+## Plot settings
+## -----------------------------
+
+genotype_cols <- c(
+  "2_het" = "#261A68",
+  "3_mut" = "#B61515"
+)
+
+genotype_labels <- c(
+  "2_het" = "abcc6a+/-",
+  "3_mut" = "abcc6a-/-"
+)
+
+scamp_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(colour = "black"),
+    legend.title = element_blank()
+  )
+```
+
+# 1. Helper functions
+
+```{r helper-functions}
+## -----------------------------
+## Profile length normalization
+## -----------------------------
+
+normalize_row <- function(row, target_length = 1000) {
+  row <- as.numeric(row)
+  row <- row[is.finite(row)]
+
+  if (length(row) == 0) {
+    return(rep(NA_real_, target_length))
+  }
+
+  if (length(row) == 1) {
+    return(rep(row, target_length))
+  }
+
+  approx(
+    x = seq_along(row),
+    y = row,
+    xout = seq(1, length(row), length.out = target_length),
+    rule = 2
+  )$y
+}
+
+normalize_dataframe <- function(df, target_length = 1000, fixed_columns = 2) {
+  fixed_data <- df[, 1:fixed_columns, drop = FALSE]
+  variable_data <- df[, (fixed_columns + 1):ncol(df), drop = FALSE]
+
+  normalized_data <- variable_data %>%
+    apply(1, normalize_row, target_length = target_length) %>%
+    t() %>%
+    as.data.frame()
+
+  colnames(normalized_data) <- paste0("V", seq_len(target_length))
+
+  cbind(fixed_data, normalized_data)
+}
+
+## -----------------------------
+## Dataset-wide positive threshold
+## -----------------------------
+
+estimate_positive_threshold_low_tail <- function(pixel_matrix,
+                                                 background_quantile = 0.60,
+                                                 multiplier = 3) {
+  values <- as.numeric(pixel_matrix)
+  values <- values[is.finite(values)]
+  values <- values[values >= 0]
+
+  cutoff <- quantile(values, background_quantile, na.rm = TRUE)
+  bg_values <- values[values <= cutoff]
+
+  baseline <- median(bg_values, na.rm = TRUE)
+  noise_mad <- mad(bg_values, constant = 1.4826, na.rm = TRUE)
+
+  threshold <- baseline + multiplier * noise_mad
+
+  tibble(
+    threshold = threshold,
+    baseline = baseline,
+    noise_mad = noise_mad,
+    background_quantile = background_quantile,
+    multiplier = multiplier,
+    method = "low-tail median + multiplier*MAD"
+  )
+}
+
+## -----------------------------
+## P-value formatting
+## -----------------------------
+
+format_p_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "n.c.",
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+
+format_p_value <- function(p) {
+  ifelse(is.na(p), NA_character_, formatC(p, format = "e", digits = 3))
+}
+
+## -----------------------------
+## Robust statistical helpers
+## -----------------------------
+
+safe_welch_p <- function(data, value_col, group_col) {
+  df <- data %>%
+    select(value = all_of(value_col), group = all_of(group_col)) %>%
+    filter(!is.na(value), !is.na(group)) %>%
+    mutate(group = droplevels(as.factor(group)))
+
+  if (n_distinct(df$group) < 2) return(NA_real_)
+  if (any(table(df$group) < 2)) return(NA_real_)
+  if (sd(df$value, na.rm = TRUE) < .Machine$double.eps) return(NA_real_)
+
+  tryCatch(
+    t.test(value ~ group, data = df, var.equal = FALSE)$p.value,
+    error = function(e) NA_real_
+  )
+}
+
+safe_levene_p <- function(data, value_col, group_col) {
+  df <- data %>%
+    select(value = all_of(value_col), group = all_of(group_col)) %>%
+    filter(!is.na(value), !is.na(group)) %>%
+    mutate(group = droplevels(as.factor(group)))
+
+  if (n_distinct(df$group) < 2) return(NA_real_)
+  if (any(table(df$group) < 2)) return(NA_real_)
+  if (sd(df$value, na.rm = TRUE) < .Machine$double.eps) return(NA_real_)
+
+  tryCatch(
+    {
+      test <- car::leveneTest(value ~ group, data = df, center = median)
+      as.numeric(test[["Pr(>F)"]][1])
+    },
+    error = function(e) NA_real_
+  )
+}
+
+safe_one_way_anova <- function(data, value_col, group_col, metric_id, metric_label) {
+  df <- data %>%
+    select(value = all_of(value_col), group = all_of(group_col)) %>%
+    filter(!is.na(value), !is.na(group)) %>%
+    mutate(group = droplevels(as.factor(group)))
+
+  if (n_distinct(df$group) < 2) {
+    return(tibble(
+      metric_id = metric_id,
+      metric = metric_label,
+      term = NA_character_,
+      p_value = NA_real_,
+      p_value_formatted = NA_character_,
+      significance = "n.c."
+    ))
+  }
+
+  tryCatch(
+    {
+      model <- aov(value ~ group, data = df)
+      as.data.frame(summary(model)[[1]]) %>%
+        tibble::rownames_to_column("term") %>%
+        mutate(
+          metric_id = metric_id,
+          metric = metric_label,
+          p_value = `Pr(>F)`,
+          p_value_formatted = format_p_value(p_value),
+          significance = format_p_stars(p_value)
+        ) %>%
+        select(metric_id, metric, term, everything())
+    },
+    error = function(e) {
+      tibble(
+        metric_id = metric_id,
+        metric = metric_label,
+        term = NA_character_,
+        p_value = NA_real_,
+        p_value_formatted = NA_character_,
+        significance = "n.c."
+      )
+    }
+  )
+}
+
+max_or_one <- function(x) {
+  out <- suppressWarnings(max(x, na.rm = TRUE))
+  if (!is.finite(out) || out <= 0) out <- 1
+  out
+}
+```
+
+# 2. Load and normalize SCAMP fluorescence profiles
+
+```{r load-scamp-data}
+if (!file.exists(scamp_data_path)) {
+  stop("SCAMP input file not found: ", scamp_data_path)
+}
+
+scamp_raw <- read.csv2(
+  scamp_data_path,
+  header = TRUE,
+  check.names = FALSE
+)
+
+scamp_norm <- normalize_dataframe(
+  scamp_raw,
+  target_length = 1000,
+  fixed_columns = 2
+)
+
+pixel_data <- scamp_norm %>%
+  select(starts_with("V")) %>%
+  as.matrix()
+
+storage.mode(pixel_data) <- "numeric"
+
+fish_info <- scamp_norm[[1]]
+genotype_info_raw <- as.character(scamp_norm[[2]])
+
+keep_rows <- genotype_info_raw %in% names(genotype_labels)
+
+pixel_data <- pixel_data[keep_rows, , drop = FALSE]
+fish_info <- fish_info[keep_rows]
+genotype_info_raw <- genotype_info_raw[keep_rows]
+
+genotype_info <- factor(
+  genotype_info_raw,
+  levels = names(genotype_labels),
+  labels = genotype_labels
+)
+
+kable(
+  tibble(
+    n_specimens = nrow(pixel_data),
+    n_positions = ncol(pixel_data),
+    genotypes = paste(levels(genotype_info), collapse = ", ")
+  ),
+  caption = "Loaded and normalized SCAMP profile matrix"
+)
+```
+
+# 3. Build SCAMP biomarker table
+
+```{r metric-table}
+threshold_info <- estimate_positive_threshold_low_tail(
+  pixel_data,
+  background_quantile = 0.60,
+  multiplier = 3
+)
+
+positive_threshold <- threshold_info$threshold[[1]]
+
+write.csv2(
+  threshold_info,
+  file.path(qc_dir, "SCAMP_positive_threshold_info.csv"),
+  row.names = FALSE
+)
+
+scamp_metric_df <- data.frame(
+  fish = fish_info,
+  genotype_raw = genotype_info_raw,
+
+  integrated_fluorescence = rowSums(
+    pixel_data,
+    na.rm = TRUE
+  ),
+
+  positive_area = apply(
+    pixel_data,
+    1,
+    function(x) mean(x > positive_threshold, na.rm = TRUE) * 100
+  ),
+
+  mean_positive_fluorescence = apply(
+    pixel_data,
+    1,
+    function(x) {
+      positive_pixels <- x[x > positive_threshold]
+      if (length(positive_pixels) == 0) return(NA_real_)
+      mean(positive_pixels, na.rm = TRUE)
+    }
+  )
+) %>%
+  mutate(
+    genotype = factor(
+      genotype_raw,
+      levels = names(genotype_labels),
+      labels = genotype_labels
+    )
+  ) %>%
+  filter(!is.na(genotype))
+
+write.csv2(
+  scamp_metric_df,
+  file.path(statistics_dir, "SCAMP_hom_het_fluorescence_metrics_per_fish.csv"),
+  row.names = FALSE
+)
+
+kable(threshold_info, caption = "Dataset-wide positive-threshold estimate")
+kable(head(scamp_metric_df), caption = "SCAMP-derived fluorescence metrics")
+```
+
+# 4. Unified two-genotype analysis and plotting function
+
+```{r two-group-analysis-function}
+make_two_group_metric_analysis <- function(data,
+                                           metric,
+                                           y_label,
+                                           plot_title,
+                                           metric_id = NULL) {
+  metric <- rlang::ensym(metric)
+  metric_name <- rlang::as_string(metric)
+  if (is.null(metric_id)) metric_id <- metric_name
+
+  plot_df <- data %>%
+    filter(!is.na(.data[[metric_name]]))
+
+  ## One-way ANOVA is exported for completeness.
+  ## For two groups, Welch's t-test is used as the primary plotted comparison.
+  anova_table <- safe_one_way_anova(
+    plot_df,
+    value_col = metric_name,
+    group_col = "genotype",
+    metric_id = metric_id,
+    metric_label = plot_title
+  )
+
+  p_welch <- safe_welch_p(
+    plot_df,
+    value_col = metric_name,
+    group_col = "genotype"
+  )
+
+  welch_table <- tibble(
+    metric_id = metric_id,
+    metric = plot_title,
+    comparison = "abcc6a+/- vs abcc6a-/-",
+    test = "Welch two-sample t-test",
+    p_raw = p_welch,
+    p_adj_BH = p_welch,
+    p_label = format_p_stars(p_welch),
+    p_raw_formatted = format_p_value(p_welch),
+    p_adj_BH_formatted = format_p_value(p_welch)
+  )
+
+  y_pos <- max_or_one(plot_df[[metric_name]]) * 1.12
+
+  sig_df <- tibble(
+    x = 1,
+    xend = 2,
+    y = y_pos,
+    yend = y_pos,
+    label_x = 1.5,
+    label_y = y_pos * 1.04,
+    label = format_p_stars(p_welch)
+  )
+
+  plot <- ggplot(
+    plot_df,
+    aes(
+      x = genotype,
+      y = .data[[metric_name]],
+      fill = genotype,
+      colour = genotype
+    )
+  ) +
+    geom_boxplot(
+      width = 0.22,
+      linewidth = 0.8,
+      alpha = 0.45,
+      outlier.shape = NA
+    ) +
+    geom_jitter(
+      width = 0.12,
+      size = 2.5,
+      alpha = 0.85
+    ) +
+    geom_segment(
+      data = sig_df,
+      aes(x = x, xend = xend, y = y, yend = yend),
+      inherit.aes = FALSE,
+      linewidth = 0.5,
+      colour = "black"
+    ) +
+    geom_text(
+      data = sig_df,
+      aes(x = label_x, y = label_y, label = label),
+      inherit.aes = FALSE,
+      size = 5
+    ) +
+    scale_fill_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+    scale_colour_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+    coord_cartesian(ylim = c(0, y_pos * 1.18), clip = "off") +
+    scamp_theme +
+    theme(legend.position = "none") +
+    labs(
+      x = "Genotype",
+      y = y_label,
+      title = plot_title
+    )
+
+  list(
+    plot = plot,
+    anova = anova_table,
+    welch = welch_table,
+    data = plot_df
+  )
+}
+```
+
+# 5. SCAMP fluorescence metric analyses
+
+```{r fluorescence-metric-analyses}
+integrated_result <- make_two_group_metric_analysis(
+  data = scamp_metric_df,
+  metric = integrated_fluorescence,
+  y_label = "Integrated fluorescence (a.u.)",
+  plot_title = "Total mineralization burden",
+  metric_id = "integrated_fluorescence"
+)
+
+positive_area_result <- make_two_group_metric_analysis(
+  data = scamp_metric_df,
+  metric = positive_area,
+  y_label = paste0(
+    "Positive area (%)\nThreshold = ",
+    round(positive_threshold, 2),
+    " a.u."
+  ),
+  plot_title = "Extent of spinal mineralization",
+  metric_id = "positive_area"
+)
+
+mean_positive_result <- make_two_group_metric_analysis(
+  data = scamp_metric_df,
+  metric = mean_positive_fluorescence,
+  y_label = paste0(
+    "Mean positive fluorescence (a.u.)\nThreshold = ",
+    round(positive_threshold, 2),
+    " a.u."
+  ),
+  plot_title = "Mineralization density",
+  metric_id = "mean_positive_fluorescence"
+)
+
+p_integrated <- integrated_result$plot
+p_positive_area <- positive_area_result$plot
+p_density <- mean_positive_result$plot
+
+fluorescence_anova_results <- bind_rows(
+  integrated_result$anova,
+  positive_area_result$anova,
+  mean_positive_result$anova
+)
+
+fluorescence_welch_results <- bind_rows(
+  integrated_result$welch,
+  positive_area_result$welch,
+  mean_positive_result$welch
+)
+
+write.csv2(
+  fluorescence_anova_results,
+  file.path(statistics_dir, "SCAMP_hom_het_one_way_ANOVA_results.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  fluorescence_welch_results,
+  file.path(statistics_dir, "SCAMP_hom_het_Welch_results.csv"),
+  row.names = FALSE
+)
+
+kable(fluorescence_anova_results, caption = "SCAMP fluorescence metric one-way ANOVA results")
+kable(fluorescence_welch_results, caption = "SCAMP fluorescence metric Welch test results")
+```
+
+# 6. Integrated fluorescence variability analysis
+
+```{r integrated-variance-analysis}
+## Brown-Forsythe Levene test: genotype-specific variance comparison
+## for integrated fluorescence. This follows the same logic as the
+## MB-PPi analysis, but here there is only one genotype comparison,
+## so BH-adjusted p is identical to the raw p value.
+
+integrated_variance_summary <- scamp_metric_df %>%
+  filter(!is.na(integrated_fluorescence), !is.na(genotype)) %>%
+  group_by(genotype) %>%
+  summarise(
+    n = n(),
+    mean = mean(integrated_fluorescence, na.rm = TRUE),
+    median = median(integrated_fluorescence, na.rm = TRUE),
+    sd = sd(integrated_fluorescence, na.rm = TRUE),
+    variance = var(integrated_fluorescence, na.rm = TRUE),
+    cv_percent = ifelse(mean > 0, sd / mean * 100, NA_real_),
+    .groups = "drop"
+  )
+
+integrated_levene_results <- tibble(
+  metric_id = "integrated_fluorescence",
+  metric = "Integrated fluorescence",
+  comparison = "abcc6a+/- vs abcc6a-/-",
+  test = "Brown-Forsythe Levene test; center = median",
+  p_raw = safe_levene_p(
+    scamp_metric_df,
+    value_col = "integrated_fluorescence",
+    group_col = "genotype"
+  )
+) %>%
+  mutate(
+    p_adj_BH = p_raw,
+    p_label = format_p_stars(p_adj_BH),
+    p_raw_formatted = format_p_value(p_raw),
+    p_adj_BH_formatted = format_p_value(p_adj_BH)
+  )
+
+write.csv2(
+  integrated_variance_summary,
+  file.path(statistics_dir, "SCAMP_hom_het_integrated_fluorescence_variance_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  integrated_levene_results,
+  file.path(statistics_dir, "SCAMP_hom_het_integrated_fluorescence_Levene_BrownForsythe_results.csv"),
+  row.names = FALSE
+)
+
+kable(integrated_variance_summary, caption = "Integrated fluorescence variance summary by genotype")
+kable(integrated_levene_results, caption = "Integrated fluorescence variance comparison between genotypes")
+```
+
+# 7. Heatmap visualization
+
+```{r heatmap-original-style, fig.width=12, fig.height=8}
+## The heatmap is exported separately because ComplexHeatmap is not a ggplot object.
+## Rows represent specimens; columns represent normalized spine positions.
+## Color shows row-wise relative pattern intensity, while the barplot annotation
+## shows integrated fluorescence per specimen.
+
+total_intensity <- rowSums(pixel_data, na.rm = TRUE)
+
+row_max <- rowMaxs(as.matrix(pixel_data), na.rm = TRUE)
+row_max[!is.finite(row_max) | row_max <= 0] <- 1
+
+pixel_pattern <- sweep(
+  pixel_data,
+  1,
+  row_max,
+  "/"
+)
+
+pixel_pattern[is.na(pixel_pattern)] <- 0
+
+col_fun_pattern <- colorRamp2(
+  c(0, 0.5, 1),
+  c("blue", "white", "red")
+)
+
+ha <- rowAnnotation(
+  Genotype = genotype_info,
+  `Integrated fluorescence\n(a.u.)` = anno_barplot(
+    total_intensity,
+    border = FALSE,
+    gp = gpar(fill = "grey40")
+  ),
+  col = list(
+    Genotype = setNames(unname(genotype_cols), genotype_labels)
+  )
+)
+
+heatmap <- Heatmap(
+  pixel_pattern,
+  name = "Pattern\n(relative intensity)",
+  col = col_fun_pattern,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  right_annotation = ha,
+  heatmap_legend_param = list(
+    title = "Pattern\nrelative intensity",
+    at = c(0, 0.5, 1),
+    labels = c("0", "0.5", "1")
+  )
+)
+
+pdf(
+  file.path(figure_dir, "SCAMP_hom_het_heatmap.pdf"),
+  width = 12,
+  height = 8
+)
+draw(heatmap)
+dev.off()
+
+png(
+  file.path(figure_dir, "SCAMP_hom_het_heatmap.png"),
+  width = 2400,
+  height = 1600,
+  res = 200
+)
+draw(heatmap)
+dev.off()
+
+heatmap
+```
+
+# 8. Ribbon plot of spatial mineralization pattern
+
+```{r ribbon-plot, fig.width=12, fig.height=5}
+long_df <- scamp_metric_df %>%
+  select(fish, genotype) %>%
+  bind_cols(as.data.frame(pixel_data)) %>%
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "Pixel",
+    values_to = "Intensity"
+  ) %>%
+  mutate(
+    Pixel = as.numeric(gsub("V", "", Pixel)),
+    Intensity = as.numeric(Intensity)
+  )
+
+ribbon_df <- long_df %>%
+  group_by(Pixel, genotype) %>%
+  summarise(
+    n = sum(!is.na(Intensity)),
+    mean = mean(Intensity, na.rm = TRUE),
+    median = median(Intensity, na.rm = TRUE),
+    sd = sd(Intensity, na.rm = TRUE),
+    sem = sd / sqrt(n),
+    CI_lower = ifelse(
+      n > 1,
+      pmax(mean - qt(0.975, df = n - 1) * sem, 0),
+      NA_real_
+    ),
+    CI_upper = ifelse(
+      n > 1,
+      mean + qt(0.975, df = n - 1) * sem,
+      NA_real_
+    ),
+    .groups = "drop"
+  )
+
+positive_regions <- ribbon_df %>%
+  group_by(genotype) %>%
+  arrange(Pixel, .by_group = TRUE) %>%
+  mutate(
+    positive = mean > positive_threshold,
+    region_id = cumsum(positive != lag(positive, default = FALSE))
+  ) %>%
+  filter(positive) %>%
+  group_by(genotype, region_id) %>%
+  summarise(
+    xmin = min(Pixel, na.rm = TRUE),
+    xmax = max(Pixel, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_ribbon <- ggplot(
+  ribbon_df,
+  aes(
+    x = Pixel,
+    y = mean,
+    colour = genotype,
+    fill = genotype
+  )
+) +
+  geom_rect(
+    data = positive_regions,
+    aes(
+      xmin = xmin,
+      xmax = xmax,
+      ymin = -Inf,
+      ymax = Inf,
+      fill = genotype
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.10,
+    colour = NA
+  ) +
+  geom_ribbon(
+    aes(ymin = CI_lower, ymax = CI_upper),
+    colour = NA,
+    alpha = 0.35
+  ) +
+  geom_line(linewidth = 1) +
+  geom_hline(
+    yintercept = positive_threshold,
+    linetype = "dashed",
+    colour = "grey35",
+    linewidth = 0.4
+  ) +
+  scale_fill_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+  scale_colour_manual(values = setNames(unname(genotype_cols), genotype_labels)) +
+  coord_cartesian(ylim = c(0, max_or_one(ribbon_df$CI_upper) * 1.05)) +
+  scamp_theme +
+  labs(
+    x = "Normalised spine position",
+    y = "Mean fluorescence intensity (a.u.)",
+    title = "Spatial mineralization profile"
+  )
+
+p_ribbon
+```
+
+# 9. Biomarker plots
+
+```{r biomarker-plots, fig.width=12, fig.height=4}
+p_integrated | p_positive_area | p_density
+```
+
+# 10. Final ggplot figure export
+
+```{r final-ggplot-export, fig.width=12, fig.height=8}
+## Heatmap is saved separately above. This combined figure contains ggplot panels only.
+
+final_figure <-
+  p_ribbon /
+  (p_integrated | p_positive_area | p_density) +
+  plot_layout(heights = c(1.2, 1)) +
+  plot_annotation(
+    title = "SCAMP hom/het mineralization analysis",
+    tag_levels = "A"
+  )
+
+ggsave(
+  filename = file.path(figure_dir, "SCAMP_hom_het_summary_ggplots.pdf"),
+  plot = final_figure,
+  width = 12,
+  height = 8,
+  units = "in",
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = file.path(figure_dir, "SCAMP_hom_het_summary_ggplots.png"),
+  plot = final_figure,
+  width = 12,
+  height = 8,
+  units = "in",
+  dpi = 600
+)
+
+final_figure
+```
+
+# 11. Session information
+
+```{r session-info}
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(qc_dir, "sessionInfo.txt")
+)
+
+sessionInfo()
+```

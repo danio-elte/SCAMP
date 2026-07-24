@@ -1,0 +1,821 @@
+---
+title: "SCAMP ROI-like spatial pattern analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## ================================================================
+## SCAMP ROI-like spatial pattern analysis
+## ---------------------------------------------------------------
+## Input expected in the working directory:
+##   MB_PPi_data_combined.csv
+##
+## Expected structure:
+##   column 1: fish/sample identifier
+##   column 2: treatment code
+##   column 3: replicate/other metadata
+##   column 4: genotype code
+##   remaining columns: longitudinal SCAMP fluorescence profile
+##
+## This complementary analysis uses treatment-specific thresholds
+## solely to compare spatial patterns of continuous positive regions.
+## It is not an analysis of absolute fluorescence or absolute positive area.
+## ================================================================
+
+required_packages <- c(
+  "tidyverse",
+  "patchwork",
+  "knitr",
+  "lmerTest",
+  "emmeans"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing required package(s): ",
+    paste(missing_packages, collapse = ", "),
+    ". Install them before running this notebook."
+  )
+}
+
+library(tidyverse)
+library(patchwork)
+library(knitr)
+library(lmerTest)
+library(emmeans)
+
+## Sum-to-zero contrasts are used for interpretable Type III tests.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+## -----------------------------
+## User-editable settings
+## -----------------------------
+
+analysis_root <- normalizePath(
+  getwd(),
+  winslash = "/",
+  mustWork = TRUE
+)
+
+scamp_data_path <- file.path(analysis_root, "MB_PPi_data_combined.csv")
+
+output_dir <- file.path(
+  analysis_root,
+  "Results",
+  "ROI_like_spatial_analysis_S6_only"
+)
+figure_dir <- file.path(output_dir, "Figures")
+statistics_dir <- file.path(output_dir, "Statistics")
+qc_dir <- file.path(output_dir, "QC")
+
+ensure_output_dirs <- function() {
+  output_directories <- c(
+    output_dir,
+    figure_dir,
+    statistics_dir,
+    qc_dir
+  )
+
+  for (current_directory in output_directories) {
+    if (!dir.exists(current_directory)) {
+      dir.create(
+        current_directory,
+        recursive = TRUE,
+        showWarnings = FALSE
+      )
+    }
+  }
+
+  missing_directories <- output_directories[
+    !vapply(output_directories, dir.exists, logical(1))
+  ]
+
+  if (length(missing_directories) > 0) {
+    stop(
+      "Could not create output directorie(s): ",
+      paste(missing_directories, collapse = ", ")
+    )
+  }
+
+  invisible(output_directories)
+}
+
+ensure_output_dirs()
+
+target_length <- 1000L
+fixed_columns <- 4L
+background_quantile <- 0.60
+mad_multiplier <- 3
+loess_span <- 0.75
+
+## -----------------------------
+## Experimental labels and colours
+## -----------------------------
+
+genotype_labels <- c(
+  "2_het" = "abcc6a+/-",
+  "3_mut" = "abcc6a-/-"
+)
+
+treatment_levels <- c(
+  "_-PPi_-MB",
+  "_-PPi_+MB",
+  "_+PPi_-MB",
+  "_+PPi_+MB"
+)
+
+treatment_labels <- c(
+  "_-PPi_-MB" = "-MB\n-PPi",
+  "_-PPi_+MB" = "+MB\n-PPi",
+  "_+PPi_-MB" = "-MB\n+PPi",
+  "_+PPi_+MB" = "+MB\n+PPi"
+)
+
+mb_map <- c(
+  "_-PPi_-MB" = "-MB",
+  "_-PPi_+MB" = "+MB",
+  "_+PPi_-MB" = "-MB",
+  "_+PPi_+MB" = "+MB"
+)
+
+ppi_map <- c(
+  "_-PPi_-MB" = "-PPi",
+  "_-PPi_+MB" = "-PPi",
+  "_+PPi_-MB" = "+PPi",
+  "_+PPi_+MB" = "+PPi"
+)
+
+ppi_cols <- c(
+  "-PPi" = "#FFFFFF",
+  "+PPi" = "#000000"
+)
+
+genotype_background_data <- tibble(
+  genotype = factor(
+    unname(genotype_labels),
+    levels = unname(genotype_labels)
+  )
+)
+
+scamp_theme <- theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(colour = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.title = element_blank()
+  )
+```
+
+# 1. Helper functions
+
+```{r helper-functions}
+## -----------------------------
+## Profile length normalization
+## -----------------------------
+
+normalize_row <- function(row, target_length = 1000L) {
+  row <- as.numeric(row)
+  valid <- which(is.finite(row))
+
+  if (length(valid) == 0) {
+    return(rep(NA_real_, target_length))
+  }
+
+  row <- row[min(valid):max(valid)]
+
+  if (length(row) == 1) {
+    return(rep(row, target_length))
+  }
+
+  approx(
+    x = seq(0, 1, length.out = length(row)),
+    y = row,
+    xout = seq(0, 1, length.out = target_length),
+    rule = 2
+  )$y
+}
+
+## -----------------------------
+## Treatment-specific threshold
+## -----------------------------
+
+estimate_positive_threshold <- function(pixel_matrix,
+                                        background_quantile = 0.60,
+                                        multiplier = 3) {
+  values <- as.numeric(pixel_matrix)
+  values <- values[is.finite(values) & values >= 0]
+
+  cutoff <- unname(quantile(
+    values,
+    probs = background_quantile,
+    na.rm = TRUE,
+    names = FALSE,
+    type = 7
+  ))
+
+  background_values <- values[values <= cutoff]
+  baseline <- median(background_values, na.rm = TRUE)
+  noise_mad <- mad(
+    background_values,
+    center = baseline,
+    constant = 1.4826,
+    na.rm = TRUE
+  )
+
+  tibble(
+    threshold = baseline + multiplier * noise_mad,
+    baseline = baseline,
+    noise_mad = noise_mad,
+    lower_tail_cutoff = cutoff,
+    background_quantile = background_quantile,
+    multiplier = multiplier,
+    method = "low-tail median + multiplier × scaled MAD"
+  )
+}
+
+## -----------------------------
+## Continuous positive regions
+## -----------------------------
+
+extract_positive_regions <- function(binary_profile) {
+  binary_profile[is.na(binary_profile)] <- FALSE
+  runs <- rle(binary_profile)
+  run_ends <- cumsum(runs$lengths)
+  run_starts <- run_ends - runs$lengths + 1L
+  positive_runs <- which(runs$values)
+
+  if (length(positive_runs) == 0) {
+    return(tibble())
+  }
+
+  tibble(
+    region_id = seq_along(positive_runs),
+    start_index = run_starts[positive_runs],
+    end_index = run_ends[positive_runs],
+    region_length = runs$lengths[positive_runs],
+    centroid_index = (run_starts[positive_runs] + run_ends[positive_runs]) / 2,
+    AP_position_percent =
+      ((centroid_index - 1) / (length(binary_profile) - 1)) * 100,
+    relative_region_length_percent =
+      (region_length / length(binary_profile)) * 100
+  )
+}
+
+format_p_value <- function(p) {
+  ifelse(is.na(p), NA_character_, formatC(p, format = "e", digits = 3))
+}
+
+format_p_stars <- function(p) {
+  case_when(
+    is.na(p) ~ "n.c.",
+    p < 0.0001 ~ "****",
+    p < 0.001 ~ "***",
+    p < 0.01 ~ "**",
+    p < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+}
+```
+
+# 2. Load and normalize SCAMP fluorescence profiles
+
+```{r load-and-normalize-data}
+if (!file.exists(scamp_data_path)) {
+  stop("SCAMP input file not found: ", scamp_data_path)
+}
+
+scamp_raw <- read.csv2(
+  scamp_data_path,
+  header = TRUE,
+  check.names = FALSE
+)
+
+if (ncol(scamp_raw) <= fixed_columns) {
+  stop("No fluorescence-profile columns found after the first four metadata columns.")
+}
+
+pixel_data <- t(apply(
+  scamp_raw[, (fixed_columns + 1):ncol(scamp_raw), drop = FALSE],
+  1,
+  normalize_row,
+  target_length = target_length
+))
+
+storage.mode(pixel_data) <- "numeric"
+colnames(pixel_data) <- paste0("P", seq_len(target_length))
+
+meta <- tibble(
+  fish = make.unique(as.character(scamp_raw[[1]])),
+  treatment_raw = as.character(scamp_raw[[2]]),
+  genotype_raw = as.character(scamp_raw[[4]])
+) %>%
+  mutate(
+    genotype = factor(
+      genotype_raw,
+      levels = names(genotype_labels),
+      labels = genotype_labels
+    ),
+    treatment = factor(
+      unname(treatment_labels[treatment_raw]),
+      levels = unname(treatment_labels)
+    ),
+    MB = factor(
+      unname(mb_map[treatment_raw]),
+      levels = c("-MB", "+MB")
+    ),
+    PPi = factor(
+      unname(ppi_map[treatment_raw]),
+      levels = c("-PPi", "+PPi")
+    )
+  )
+
+keep <- complete.cases(meta[, c("genotype", "treatment", "MB", "PPi")])
+meta <- meta[keep, ]
+pixel_data <- pixel_data[keep, , drop = FALSE]
+
+if (!all(c("fish", "genotype", "treatment", "MB", "PPi") %in% names(meta))) {
+  stop("Required metadata columns could not be constructed.")
+}
+
+kable(
+  meta %>% count(genotype, MB, PPi),
+  caption = "Specimen numbers by genotype and treatment"
+)
+```
+
+# 3. Treatment-specific thresholding
+
+```{r treatment-specific-thresholds}
+ensure_output_dirs()
+
+## Genotypes are pooled within each MB/PPi treatment when estimating the
+## pattern-detection threshold. These thresholds are used only for the
+## complementary relative-pattern analysis.
+
+threshold_table <- map_dfr(levels(meta$treatment), function(current_treatment) {
+  specimen_index <- which(meta$treatment == current_treatment)
+
+  estimate_positive_threshold(
+    pixel_data[specimen_index, , drop = FALSE],
+    background_quantile = background_quantile,
+    multiplier = mad_multiplier
+  ) %>%
+    mutate(
+      treatment = current_treatment,
+      n_fish = length(specimen_index),
+      .before = 1
+    )
+})
+
+write.csv2(
+  threshold_table,
+  file.path(qc_dir, "ROI_like_treatment_specific_thresholds.csv"),
+  row.names = FALSE
+)
+
+kable(
+  threshold_table,
+  digits = 3,
+  caption = "Treatment-specific thresholds used for spatial pattern detection"
+)
+```
+
+# 4. Extract continuous positive regions
+
+```{r extract-positive-regions}
+ensure_output_dirs()
+
+binary_profiles <- matrix(
+  FALSE,
+  nrow = nrow(pixel_data),
+  ncol = ncol(pixel_data),
+  dimnames = list(NULL, paste0("P", seq_len(ncol(pixel_data))))
+)
+
+for (i in seq_len(nrow(meta))) {
+  current_threshold <- threshold_table$threshold[
+    match(as.character(meta$treatment[i]), threshold_table$treatment)
+  ]
+
+  binary_profiles[i, ] <- pixel_data[i, ] > current_threshold
+}
+
+regions <- map_dfr(seq_len(nrow(meta)), function(i) {
+  extract_positive_regions(binary_profiles[i, ]) %>%
+    mutate(
+      fish = meta$fish[i],
+      genotype = meta$genotype[i],
+      treatment = meta$treatment[i],
+      MB = meta$MB[i],
+      PPi = meta$PPi[i],
+      .before = 1
+    )
+})
+
+if (nrow(regions) == 0) {
+  stop("No continuous threshold-positive regions were detected.")
+}
+
+write.csv2(
+  regions,
+  file.path(statistics_dir, "ROI_like_positive_regions.csv"),
+  row.names = FALSE
+)
+
+kable(
+  regions %>%
+    group_by(genotype, MB, PPi) %>%
+    summarise(
+      fish = n_distinct(fish),
+      regions = n(),
+      mean_relative_length = mean(relative_region_length_percent),
+      median_relative_length = median(relative_region_length_percent),
+      .groups = "drop"
+    ),
+  digits = 3,
+  caption = "Descriptive summary of continuous positive regions"
+)
+```
+
+# 5. Region-length linear mixed-effects model
+
+```{r region-length-mixed-model}
+ensure_output_dirs()
+
+## Multiple continuous regions can originate from the same fish. Region length
+## is therefore analysed with fish identity included as a random intercept.
+
+AP_mean <- mean(regions$AP_position_percent, na.rm = TRUE)
+AP_sd <- sd(regions$AP_position_percent, na.rm = TRUE)
+
+regions <- regions %>%
+  mutate(AP_position_scaled = (AP_position_percent - AP_mean) / AP_sd)
+
+region_length_model <- lmerTest::lmer(
+  relative_region_length_percent ~
+    genotype * MB * PPi * AP_position_scaled +
+    (1 | fish),
+  data = regions,
+  REML = FALSE
+)
+
+region_length_type3 <- anova(
+  region_length_model,
+  type = 3,
+  ddf = "Satterthwaite"
+) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("term") %>%
+  mutate(
+    p_value = `Pr(>F)`,
+    p_value_formatted = format_p_value(p_value),
+    significance = format_p_stars(p_value)
+  )
+
+## AP-axis slopes for every genotype × MB × PPi group.
+region_slopes <- emmeans::emtrends(
+  region_length_model,
+  specs = ~ genotype * MB * PPi,
+  var = "AP_position_scaled"
+)
+
+region_slopes_table <- as.data.frame(
+  summary(region_slopes, infer = c(TRUE, TRUE))
+)
+
+## PPi contrasts of AP-axis slopes within each genotype and MB condition.
+ppi_slope_contrasts <- contrast(
+  region_slopes,
+  method = "revpairwise",
+  by = c("genotype", "MB"),
+  adjust = "none"
+)
+
+ppi_slope_contrasts_table <- as.data.frame(
+  summary(ppi_slope_contrasts, infer = c(TRUE, TRUE))
+) %>%
+  mutate(
+    p_value_raw = p.value,
+    p_value_BH = p.adjust(p.value, method = "BH"),
+    significant_BH = p_value_BH < 0.05
+  )
+
+write.csv2(
+  region_length_type3,
+  file.path(statistics_dir, "ROI_like_region_length_TypeIII_mixed_model.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  region_slopes_table,
+  file.path(statistics_dir, "ROI_like_AP_axis_slopes.csv"),
+  row.names = FALSE
+)
+
+write.csv2(
+  ppi_slope_contrasts_table,
+  file.path(statistics_dir, "ROI_like_PPi_slope_contrasts_BH.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  region_length_model,
+  file.path(statistics_dir, "ROI_like_region_length_mixed_model.rds")
+)
+
+kable(
+  region_length_type3,
+  digits = 4,
+  caption = "Type III tests from the region-length linear mixed-effects model"
+)
+
+kable(
+  region_slopes_table,
+  digits = 4,
+  caption = "Estimated AP-axis slopes by genotype, MB and PPi"
+)
+
+kable(
+  ppi_slope_contrasts_table,
+  digits = 4,
+  caption = paste(
+    "PPi contrasts of AP-axis slopes within genotype and MB condition;",
+    "BH correction applied jointly across the four contrasts"
+  )
+)
+```
+
+# 6. ROI-like visualizations
+
+```{r roi-like-visualizations, fig.width=11, fig.height=7}
+ensure_output_dirs()
+
+## -----------------------------
+## Descriptive LOESS visualization
+## -----------------------------
+
+p_region_loess <- ggplot(
+  regions,
+  aes(
+    x = AP_position_percent,
+    y = relative_region_length_percent,
+    colour = PPi,
+    fill = PPi
+  )
+) +
+  geom_rect(
+    data = genotype_background_data %>%
+      filter(genotype == unname(genotype_labels["2_het"])),
+    aes(
+      xmin = -Inf,
+      xmax = Inf,
+      ymin = -Inf,
+      ymax = Inf
+    ),
+    inherit.aes = FALSE,
+    fill = "#261A68",
+    colour = NA,
+    show.legend = FALSE
+  ) +
+  geom_rect(
+    data = genotype_background_data %>%
+      filter(genotype == unname(genotype_labels["3_mut"])),
+    aes(
+      xmin = -Inf,
+      xmax = Inf,
+      ymin = -Inf,
+      ymax = Inf
+    ),
+    inherit.aes = FALSE,
+    fill = "#B61515",
+    colour = NA,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    alpha = 0.55,
+    size = 1.5,
+    position = position_jitter(width = 0.25, height = 0)
+  ) +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    span = loess_span,
+    se = TRUE,
+    linewidth = 0.8,
+    alpha = 0.16
+  ) +
+  facet_grid(genotype ~ MB) +
+  scale_colour_manual(values = ppi_cols) +
+  scale_fill_manual(values = ppi_cols) +
+  scamp_theme +
+  labs(
+    x = "Relative anterior-posterior position (%)",
+    y = "Relative positive-region length (% of normalized profile)",
+    title = "Descriptive distribution of continuous positive regions"
+  )
+
+## -----------------------------
+## Linear mixed-model predictions
+## -----------------------------
+
+prediction_grid <- tidyr::expand_grid(
+  genotype = levels(regions$genotype),
+  MB = levels(regions$MB),
+  PPi = levels(regions$PPi),
+  AP_position_percent = seq(0, 100, length.out = 200)
+) %>%
+  mutate(
+    genotype = factor(genotype, levels = levels(regions$genotype)),
+    MB = factor(MB, levels = levels(regions$MB)),
+    PPi = factor(PPi, levels = levels(regions$PPi)),
+    AP_position_scaled = (AP_position_percent - AP_mean) / AP_sd
+  )
+
+fixed_formula <- lme4::nobars(formula(region_length_model))
+X_prediction <- model.matrix(
+  delete.response(terms(fixed_formula)),
+  prediction_grid
+)
+
+fixed_coefficients <- lme4::fixef(region_length_model)
+fixed_vcov <- as.matrix(vcov(region_length_model))
+
+prediction_grid$fit <- as.numeric(X_prediction %*% fixed_coefficients)
+prediction_grid$SE <- sqrt(pmax(
+  0,
+  rowSums((X_prediction %*% fixed_vcov) * X_prediction)
+))
+
+prediction_grid <- prediction_grid %>%
+  mutate(
+    lower = fit - 1.96 * SE,
+    upper = fit + 1.96 * SE
+  )
+
+write.csv2(
+  prediction_grid,
+  file.path(statistics_dir, "ROI_like_linear_mixed_model_predictions.csv"),
+  row.names = FALSE
+)
+
+p_region_linear <- ggplot(
+  regions,
+  aes(
+    x = AP_position_percent,
+    y = relative_region_length_percent,
+    colour = PPi,
+    fill = PPi
+  )
+) +
+  geom_rect(
+    data = genotype_background_data %>%
+      filter(genotype == unname(genotype_labels["2_het"])),
+    aes(
+      xmin = -Inf,
+      xmax = Inf,
+      ymin = -Inf,
+      ymax = Inf
+    ),
+    inherit.aes = FALSE,
+    fill = "#261A68",
+    colour = NA,
+    show.legend = FALSE
+  ) +
+  geom_rect(
+    data = genotype_background_data %>%
+      filter(genotype == unname(genotype_labels["3_mut"])),
+    aes(
+      xmin = -Inf,
+      xmax = Inf,
+      ymin = -Inf,
+      ymax = Inf
+    ),
+    inherit.aes = FALSE,
+    fill = "#B61515",
+    colour = NA,
+    show.legend = FALSE
+  ) +
+  geom_point(
+    alpha = 0.45,
+    size = 1.4,
+    position = position_jitter(width = 0.25, height = 0)
+  ) +
+  geom_ribbon(
+    data = prediction_grid,
+    aes(
+      x = AP_position_percent,
+      ymin = lower,
+      ymax = upper,
+      fill = PPi,
+      group = PPi
+    ),
+    inherit.aes = FALSE,
+    alpha = 0.16,
+    colour = NA
+  ) +
+  geom_line(
+    data = prediction_grid,
+    aes(
+      x = AP_position_percent,
+      y = fit,
+      colour = PPi,
+      group = PPi
+    ),
+    inherit.aes = FALSE,
+    linewidth = 0.85
+  ) +
+  facet_grid(genotype ~ MB) +
+  scale_colour_manual(values = ppi_cols) +
+  scale_fill_manual(values = ppi_cols) +
+  scamp_theme +
+  labs(
+    x = "Relative anterior-posterior position (%)",
+    y = "Relative positive-region length (% of normalized profile)",
+    title = "Linear mixed-effects model predictions"
+  )
+
+p_region_loess
+p_region_linear
+```
+
+# 7. Figure export
+
+```{r figure-export}
+ensure_output_dirs()
+
+combined_region_figure <-
+  p_region_loess /
+  p_region_linear +
+  plot_annotation(tag_levels = "A")
+
+ggsave(
+  file.path(figure_dir, "ROI_like_region_distribution_LOESS.pdf"),
+  p_region_loess,
+  width = 11,
+  height = 7,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_region_distribution_LOESS.png"),
+  p_region_loess,
+  width = 11,
+  height = 7,
+  dpi = 600
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_region_distribution_linear_mixed_model.pdf"),
+  p_region_linear,
+  width = 11,
+  height = 7,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_region_distribution_linear_mixed_model.png"),
+  p_region_linear,
+  width = 11,
+  height = 7,
+  dpi = 600
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_region_distribution_combined.pdf"),
+  combined_region_figure,
+  width = 11,
+  height = 14,
+  device = cairo_pdf
+)
+
+ggsave(
+  file.path(figure_dir, "ROI_like_region_distribution_combined.png"),
+  combined_region_figure,
+  width = 11,
+  height = 14,
+  dpi = 600
+)
+
+combined_region_figure
+```
+
+# 8. Session information
+
+```{r session-information}
+ensure_output_dirs()
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(qc_dir, "sessionInfo.txt")
+)
+
+sessionInfo()
+```

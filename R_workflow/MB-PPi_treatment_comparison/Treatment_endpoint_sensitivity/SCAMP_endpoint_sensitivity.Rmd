@@ -1,0 +1,375 @@
+---
+title: "SCAMP positive-threshold sensitivity analysis"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c("tidyverse", "knitr")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop("Missing package(s): ", paste(missing_packages, collapse = ", "))
+}
+
+library(tidyverse)
+library(knitr)
+
+## User-editable settings -------------------------------------------------
+scamp_data_path <- "MB_PPi_data_combined.csv"
+output_dir <- "Results/Threshold_validation"
+target_length <- 1000
+fixed_columns <- 4
+alpha <- 0.05
+
+quantiles_to_test <- c(0.50, 0.60, 0.70)
+mad_multipliers_to_test <- c(2, 3, 4)
+reference_quantile <- 0.60
+reference_multiplier <- 3
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+genotype_labels <- c("2_het" = "abcc6a+/-", "3_mut" = "abcc6a-/-")
+treatment_levels <- c("_-PPi_-MB", "_-PPi_+MB", "_+PPi_-MB", "_+PPi_+MB")
+treatment_labels <- c("-MB -PPi", "+MB -PPi", "-MB +PPi", "+MB +PPi")
+```
+
+# Aim
+
+This notebook validates the dataset-wide positive-fluorescence threshold used in
+the main analysis. It tests all nine combinations of low-tail quantiles (50%,
+60%, 70%) and MAD multipliers (2, 3, 4). The original 60% + 3 MAD rule is the
+reference. Only the threshold-dependent endpoints are evaluated:
+
+1. positive area (% of pixels above threshold), and
+2. mean positive fluorescence (mean intensity among pixels above threshold).
+
+The analysis checks whether genotype/treatment conclusions are stable across
+reasonable threshold choices. It does not validate the threshold against an
+external ground truth.
+
+# Helper functions
+
+```{r helpers}
+normalize_row <- function(row, target_length = 1000) {
+  row <- as.numeric(row)
+  row <- row[is.finite(row)]
+  if (length(row) == 0) return(rep(NA_real_, target_length))
+  if (length(row) == 1) return(rep(row, target_length))
+  approx(
+    x = seq_along(row), y = row,
+    xout = seq(1, length(row), length.out = target_length), rule = 2
+  )$y
+}
+
+normalize_dataframe <- function(df, target_length = 1000, fixed_columns = 4) {
+  if (ncol(df) <= fixed_columns) stop("No pixel columns were found.")
+  fixed_data <- df[, seq_len(fixed_columns), drop = FALSE]
+  variable_data <- df[, (fixed_columns + 1):ncol(df), drop = FALSE]
+  normalized_data <- variable_data |>
+    apply(1, normalize_row, target_length = target_length) |>
+    t() |>
+    as.data.frame()
+  colnames(normalized_data) <- paste0("V", seq_len(target_length))
+  cbind(fixed_data, normalized_data)
+}
+
+estimate_threshold <- function(pixel_matrix, background_quantile, multiplier) {
+  values <- as.numeric(pixel_matrix)
+  values <- values[is.finite(values) & values >= 0]
+  if (length(values) == 0) stop("No finite, non-negative pixel values found.")
+  cutoff <- unname(quantile(values, background_quantile, na.rm = TRUE))
+  background <- values[values <= cutoff]
+  baseline <- median(background, na.rm = TRUE)
+  noise_mad <- mad(background, constant = 1.4826, na.rm = TRUE)
+  tibble(
+    background_quantile = background_quantile,
+    multiplier = multiplier,
+    low_tail_cutoff = cutoff,
+    baseline = baseline,
+    noise_mad = noise_mad,
+    threshold = baseline + multiplier * noise_mad,
+    scenario = sprintf("Q%02d_MAD%d", round(100 * background_quantile), multiplier),
+    is_reference = background_quantile == reference_quantile &
+      multiplier == reference_multiplier
+  )
+}
+
+safe_welch_p <- function(value, group) {
+  keep <- is.finite(value) & !is.na(group)
+  value <- value[keep]
+  group <- droplevels(factor(group[keep]))
+  if (nlevels(group) != 2 || any(table(group) < 2)) return(NA_real_)
+  tryCatch(t.test(value ~ group, var.equal = FALSE)$p.value,
+           error = function(e) NA_real_)
+}
+
+safe_anova <- function(data, metric) {
+  df <- data |> filter(is.finite(.data[[metric]]))
+  if (nrow(df) == 0 || n_distinct(df$genotype) < 2 ||
+      n_distinct(df$treatment) < 2) return(tibble())
+  fit <- tryCatch(
+    aov(reformulate("genotype * treatment", response = metric), data = df),
+    error = function(e) NULL
+  )
+  if (is.null(fit)) return(tibble())
+  as.data.frame(summary(fit)[[1]]) |>
+    rownames_to_column("term") |>
+    transmute(term = trimws(term), p_value = `Pr(>F)`)
+}
+
+sign_class <- function(x, tolerance = sqrt(.Machine$double.eps)) {
+  case_when(is.na(x) ~ NA_character_, x > tolerance ~ "positive",
+            x < -tolerance ~ "negative", TRUE ~ "zero")
+}
+```
+
+# Load and normalize the SCAMP profiles
+
+```{r load-data}
+if (!file.exists(scamp_data_path)) stop("SCAMP input not found: ", scamp_data_path)
+scamp_raw <- read.csv2(scamp_data_path, header = TRUE, check.names = FALSE)
+if (ncol(scamp_raw) <= fixed_columns) stop("Expected four metadata columns followed by pixel columns.")
+
+scamp_norm <- normalize_dataframe(scamp_raw, target_length, fixed_columns)
+pixel_data <- as.matrix(scamp_norm[, (fixed_columns + 1):ncol(scamp_norm)])
+storage.mode(pixel_data) <- "numeric"
+
+sample_info <- tibble(
+  sample_id = as.character(scamp_norm[[1]]),
+  treatment_raw = as.character(scamp_norm[[2]]),
+  genotype_raw = as.character(scamp_norm[[4]]),
+  genotype = factor(genotype_raw, levels = names(genotype_labels),
+                    labels = unname(genotype_labels)),
+  treatment = factor(treatment_raw, levels = treatment_levels,
+                     labels = treatment_labels)
+)
+
+if (anyNA(sample_info$genotype) || anyNA(sample_info$treatment)) {
+  warning("Samples with unrecognized genotype/treatment labels are excluded from inference.")
+}
+
+kable(sample_info |> count(genotype, treatment, .drop = FALSE),
+      caption = "Sample counts by group")
+```
+
+# Threshold grid
+
+```{r threshold-grid}
+threshold_grid <- tidyr::crossing(
+  background_quantile = quantiles_to_test,
+  multiplier = mad_multipliers_to_test
+) |>
+  pmap_dfr(~ estimate_threshold(pixel_data, ..1, ..2))
+
+if (sum(threshold_grid$is_reference) != 1) stop("Reference threshold is not unique.")
+
+write.csv2(threshold_grid, file.path(output_dir, "threshold_grid.csv"), row.names = FALSE)
+kable(threshold_grid, digits = 3, caption = "Thresholds under all sensitivity scenarios")
+```
+
+```{r threshold-plot, fig.width=7, fig.height=4}
+ggplot(threshold_grid,
+       aes(factor(multiplier), threshold, colour = factor(background_quantile))) +
+  geom_line(aes(group = background_quantile)) +
+  geom_point(aes(shape = is_reference), size = 3) +
+  scale_colour_brewer(
+    palette = "Dark2",
+    labels = function(x) paste0(as.numeric(as.character(x)) * 100, "%")
+  ) +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 8)) +
+  theme_classic() +
+  labs(x = "MAD multiplier", y = "Positive threshold (a.u.)",
+       colour = "Low-tail quantile", shape = "Reference")
+```
+
+# Recalculate threshold-dependent endpoints
+
+```{r metrics}
+metric_long <- threshold_grid |>
+  select(scenario, background_quantile, multiplier, threshold, is_reference) |>
+  pmap_dfr(function(scenario, background_quantile, multiplier, threshold,
+                    is_reference) {
+    positive_area <- apply(pixel_data, 1, function(x) {
+      valid <- is.finite(x)
+      if (!any(valid)) return(NA_real_)
+      mean(x[valid] > threshold) * 100
+    })
+    mean_positive <- apply(pixel_data, 1, function(x) {
+      x <- x[is.finite(x) & x > threshold]
+      if (length(x) == 0) NA_real_ else mean(x)
+    })
+    bind_cols(sample_info, tibble(
+      scenario, background_quantile, multiplier, threshold, is_reference,
+      positive_area,
+      mean_positive_fluorescence = mean_positive
+    ))
+  }) |>
+  filter(!is.na(genotype), !is.na(treatment))
+
+write.csv2(metric_long,
+           file.path(output_dir, "threshold_metrics_per_sample.csv"),
+           row.names = FALSE)
+```
+
+# Stability of biological conclusions
+
+For each endpoint and threshold, the notebook repeats only the inferential tests
+needed to judge sensitivity: the genotype, treatment, and interaction terms of
+the same two-way ANOVA, plus genotype contrasts within each treatment (Welch
+tests with BH correction across treatments). Stability is assessed against the
+60% + 3 MAD reference using both effect direction and significance at the
+pre-specified alpha level.
+
+```{r inference}
+metrics <- c("positive_area", "mean_positive_fluorescence")
+
+anova_results <- metric_long |>
+  group_by(scenario, background_quantile, multiplier, threshold, is_reference) |>
+  group_modify(~ map_dfr(metrics, function(metric) {
+    safe_anova(.x, metric) |> mutate(metric = metric, .before = 1)
+  })) |>
+  ungroup() |>
+  mutate(significant = !is.na(p_value) & p_value < alpha)
+
+contrast_results <- metric_long |>
+  pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") |>
+  group_by(scenario, background_quantile, multiplier, threshold, is_reference,
+           metric, treatment) |>
+  summarise(
+    mean_het = mean(value[genotype == genotype_labels[["2_het"]]], na.rm = TRUE),
+    mean_mut = mean(value[genotype == genotype_labels[["3_mut"]]], na.rm = TRUE),
+    effect_mut_minus_het = mean_mut - mean_het,
+    p_raw = safe_welch_p(value, genotype),
+    .groups = "drop_last"
+  ) |>
+  mutate(p_adj_BH = p.adjust(p_raw, method = "BH"),
+         direction = sign_class(effect_mut_minus_het),
+         significant = !is.na(p_adj_BH) & p_adj_BH < alpha) |>
+  ungroup()
+
+reference_anova <- anova_results |>
+  filter(is_reference) |>
+  select(metric, term, reference_p = p_value,
+         reference_significant = significant)
+
+anova_stability <- anova_results |>
+  left_join(reference_anova, by = c("metric", "term")) |>
+  mutate(same_significance = significant == reference_significant)
+
+reference_contrasts <- contrast_results |>
+  filter(is_reference) |>
+  select(metric, treatment, reference_effect = effect_mut_minus_het,
+         reference_direction = direction,
+         reference_p_adj_BH = p_adj_BH,
+         reference_significant = significant)
+
+contrast_stability <- contrast_results |>
+  left_join(reference_contrasts, by = c("metric", "treatment")) |>
+  mutate(
+    same_direction = direction == reference_direction,
+    same_significance = significant == reference_significant,
+    same_conclusion = same_direction & same_significance
+  )
+
+scenario_summary <- contrast_stability |>
+  group_by(scenario, background_quantile, multiplier, threshold, metric) |>
+  summarise(
+    all_contrast_directions_stable = all(same_direction, na.rm = TRUE),
+    all_contrast_significance_stable = all(same_significance, na.rm = TRUE),
+    all_contrast_conclusions_stable = all(same_conclusion, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  left_join(
+    anova_stability |>
+      group_by(scenario, metric) |>
+      summarise(all_anova_significance_stable = all(same_significance, na.rm = TRUE),
+                .groups = "drop"),
+    by = c("scenario", "metric")
+  ) |>
+  mutate(overall_stable = all_contrast_conclusions_stable &
+           all_anova_significance_stable)
+
+write.csv2(anova_stability, file.path(output_dir, "anova_stability.csv"), row.names = FALSE)
+write.csv2(contrast_stability, file.path(output_dir, "genotype_contrast_stability.csv"), row.names = FALSE)
+write.csv2(scenario_summary, file.path(output_dir, "scenario_stability_summary.csv"), row.names = FALSE)
+
+kable(scenario_summary, digits = 3,
+      caption = "Conclusion stability relative to 60% + 3 MAD")
+```
+
+# Effect-size overview
+
+```{r effect-plot, fig.width=10, fig.height=6}
+ggplot(contrast_stability,
+       aes(factor(multiplier), effect_mut_minus_het,
+           colour = factor(background_quantile), group = background_quantile)) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey60") +
+  geom_line() +
+  geom_point(aes(shape = significant), size = 2.5) +
+  facet_grid(metric ~ treatment, scales = "free_y") +
+  scale_colour_brewer(
+    palette = "Dark2",
+    labels = function(x) paste0(as.numeric(as.character(x)) * 100, "%")
+  ) +
+  theme_classic() +
+  labs(x = "MAD multiplier", y = "Mutant minus heterozygote mean",
+       colour = "Low-tail quantile", shape = "BH-adjusted p < alpha")
+```
+
+# Agreement with the reference endpoint values
+
+```{r agreement}
+reference_values <- metric_long |>
+  filter(is_reference) |>
+  select(sample_id, genotype, treatment, all_of(metrics)) |>
+  pivot_longer(all_of(metrics), names_to = "metric", values_to = "reference_value")
+
+metric_agreement <- metric_long |>
+  select(sample_id, genotype, treatment, scenario, background_quantile,
+         multiplier, threshold, all_of(metrics)) |>
+  pivot_longer(all_of(metrics), names_to = "metric", values_to = "value") |>
+  left_join(reference_values,
+            by = c("sample_id", "genotype", "treatment", "metric")) |>
+  group_by(scenario, background_quantile, multiplier, threshold, metric) |>
+  summarise(
+    n_complete = sum(complete.cases(value, reference_value)),
+    spearman_rho = if (n_complete >= 3)
+      cor(value, reference_value, method = "spearman", use = "complete.obs") else NA_real_,
+    median_absolute_change = median(abs(value - reference_value), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv2(metric_agreement, file.path(output_dir, "metric_agreement_with_reference.csv"),
+           row.names = FALSE)
+kable(metric_agreement, digits = 3,
+      caption = "Per-sample agreement with the reference threshold")
+```
+
+# Interpretation guardrail
+
+```{r interpretation, results='asis'}
+non_reference <- scenario_summary |> filter(scenario != "Q60_MAD3")
+fully_stable <- nrow(non_reference) > 0 && all(non_reference$overall_stable)
+
+if (fully_stable) {
+  cat("Across all tested alternative thresholds, the directions of the within-treatment genotype contrasts and the significance classifications of both the contrasts and two-way ANOVA terms matched the 60% + 3 MAD reference. This supports the statement that the principal genotype and treatment conclusions were stable within the tested sensitivity range.\n")
+} else {
+  cat("At least one conclusion changed under an alternative threshold. Inspect `scenario_stability_summary.csv`, `anova_stability.csv`, and `genotype_contrast_stability.csv`; a blanket claim of threshold robustness is not supported.\n")
+}
+```
+
+# Important limitation
+
+All thresholds above are estimated from the complete current cohort. Therefore,
+they can change if genotype/treatment group proportions change. Threshold-based
+values from separate experiments are not automatically comparable unless the
+threshold estimation strategy is harmonized or independently calibrated.
+
+```{r session-info}
+sessionInfo()
+```
