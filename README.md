@@ -1,8 +1,18 @@
-# SCAMP
+<p align="center">
+  <img src="SCAMP_icon.png" alt="SCAMP logo" width="160">
+</p>
 
-Version: `20261002_132001`
+<h1 align="center">SCAMP</h1>
 
 SCAMP (Spinal Calcification & Mineralization Profiler) is a single-file Python GUI application for converting fluorescence z-stacks of Alizarin Red S-stained fish larvae into straightened spinal images and one-dimensional longitudinal intensity profiles.
+
+## Tutorial video
+
+<p align="center">
+  <a href="https://github.com/danio-elte/SCAMP/blob/main/SCAMP-tutorial.mp4">
+    <img src="SCAMP_thumbnail.png" alt="Watch the SCAMP tutorial video" width="600">
+  </a>
+</p>
 
 ## Main workflow
 
