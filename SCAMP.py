@@ -5,15 +5,16 @@ SCAMP -- Spinal Calcification & Mineralization Profiler
 ======================================================
 
 A single-file, napari-style GUI application for the Alizarin Red S zebrafish
-spinal-mineralization pipeline, from raw CZI to a cohort heatmap.
+spinal-mineralization pipeline, from a supported microscopy z-stack to a
+cohort heatmap.
 
 (scamp.py)
 
 It unifies the whole workflow that previously lived in several separate
 scripts:
 
-    1. norm_mean_IP.py              (CZI + ROI -> background-corrected 16-bit
-                                     mean-intensity projection)
+    1. norm_mean_IP.py              (microscopy stack + ROI -> background-
+                                     corrected 16-bit intensity projection)
     2. interactive_straighten2.py   (manual landmark placement + straightening)
     3. gerinc_illesztes_batch_heatmap.py  (profile extraction + heatmap + tables)
 
@@ -25,11 +26,10 @@ Workflow inside the app
       inside it.
     * Set up the conditions for the experiment (defaults to "control",
       editable, add as many as needed).
-    * Import raw CZI files (each with a matching ImageJ .roi for the
-      background region), choosing the condition for each import batch. The
-      app builds the normalized 16-bit projection and immediately saves it
-      (the pure image, no overlay) to <ExperimentID>/normalized/.
-      You can also Open existing 16-bit projection images directly.
+    * Open supported microscopy stacks, define or import an ImageJ background
+      ROI, and assign the experimental condition. The app builds a quantitative
+      background-corrected projection and saves it as 16-bit TIFF. Existing
+      quantitative projection images can also be opened directly.
     * For each image, drag the landmark triplets onto the notochord
       (green = midline, red = dorsal, blue = ventral). Add / remove
       triplets as needed.
@@ -60,8 +60,8 @@ This script is meant to be launched like napari:
 
 Core dependencies: numpy, scipy, matplotlib, Pillow.
 Optional: pandas + openpyxl (XLSX export); opencv (extra image I/O);
-aicsimageio/bioio + roifile (CZI import). Missing optional pieces only
-disable the corresponding feature.
+aicsimageio/bioio + format plugins + roifile (microscopy-container import and
+ROI handling). Missing optional pieces only disable the corresponding feature.
 """
 
 import os
@@ -164,7 +164,7 @@ except Exception:
     _HAVE_TIFFFILE = False
 
 # ----------------------------------------------------------------------
-# Optional CZI-import dependencies.
+# Optional microscopy-import dependencies.
 #
 # aicsimageio is in maintenance-only mode; its successor is bioio
 # (+ bioio-czi). We try aicsimageio first (matches the original
@@ -172,7 +172,7 @@ except Exception:
 # as the ecosystem migrates. roifile reads the ImageJ .roi background
 # region. Any of these missing simply disables the CZI-import button.
 # ----------------------------------------------------------------------
-_CZI_READER = None  # callable(path) -> reader with get_image_data
+_CZI_READER = None  # generic callable(path) -> reader with get_image_data
 _CZI_READER_NAME = None       # which backend was loaded ("bioio" / "aicsimageio")
 _READER_IMPORT_ERRORS = {}    # backend name -> import error string (for diagnostics)
 
@@ -1533,15 +1533,14 @@ class StackEditor(ttk.Frame):
         self.transform_history = []
         self.background_roi_rect = None
         self.saved_roi_path = None
-        if os.path.splitext(self.path)[1].lower() == ".czi":
-            candidate_roi = os.path.splitext(self.path)[0] + ".roi"
-            if os.path.isfile(candidate_roi):
-                self.saved_roi_path = candidate_roi
-            history, rect = load_geometry_sidecar(self.path)
-            if history:
-                self.transform_history = history
-            if rect is not None:
-                self.background_roi_rect = rect
+        candidate_roi = os.path.splitext(self.path)[0] + ".roi"
+        if os.path.isfile(candidate_roi):
+            self.saved_roi_path = candidate_roi
+        history, rect = load_geometry_sidecar(self.path)
+        if history:
+            self.transform_history = history
+        if rect is not None:
+            self.background_roi_rect = rect
 
         self.z_index = 0
         self.selection_rect = None
@@ -1799,23 +1798,14 @@ class StackEditor(ttk.Frame):
         self.redraw()
 
     def save_roi_to_matching_file(self):
-        """Save the active rectangle as an ImageJ .roi next to the source CZI.
+        """Save the active rectangle as an ImageJ .roi next to the source stack.
 
-        The ROI is written with the same base name as the original CZI:
-        /path/sample.czi -> /path/sample.roi. Coordinates are saved in the
-        original source image coordinate system, so the command is intentionally
-        limited to untransformed CZI stacks.
+        The ROI is written with the same base name as the original microscopy
+        file (for example, sample.czi -> sample.roi or sample.nd2 -> sample.roi).
+        The ROI coordinates refer to the currently displayed stack geometry.
         """
         if self.selection_rect is None:
             messagebox.showinfo("No selection", "Draw a rectangle before saving an ROI.")
-            return
-
-        source_ext = os.path.splitext(self.path)[1].lower()
-        if source_ext != ".czi":
-            messagebox.showinfo(
-                "Save ROI unavailable",
-                "Save ROI is available only for stacks opened directly from a CZI file."
-            )
             return
 
         rect = self._normalized_selection()
@@ -2626,13 +2616,13 @@ class App(tk.Tk):
         if not _HAVE_PANDAS:
             self._log("Note: pandas not found -- XLSX export disabled, CSV only.")
 
-        # CZI reader status -- report up front so a broken reader install is
-        # obvious before the user tries to open a file.
+        # Microscopy-reader status -- report up front so a broken reader install
+        # is obvious before the user tries to open a container format.
         if _CZI_READER is not None:
-            self._log(f"CZI reader: {_CZI_READER_NAME} "
+            self._log(f"Microscopy reader: {_CZI_READER_NAME} "
                       f"(Python: {os.path.basename(sys.executable)}).")
         else:
-            self._log("WARNING: no CZI reader could be imported in this "
+            self._log("WARNING: no microscopy-container reader could be imported in this "
                       f"environment ({sys.executable}). 'Import CZI' / opening "
                       ".czi will fail until you install bioio + bioio-czi "
                       "(or aicsimageio + aicspylibczi) here.")
@@ -2782,7 +2772,13 @@ class App(tk.Tk):
         self._log(f"Closed {ed.name}")
 
     def _czi_editors_with_rois(self):
-        """Return open CZI stack editors that have a matching assigned ROI file."""
+        """Return open microscopy-stack editors with an assigned background ROI.
+
+        The historical method name is retained for compatibility with the GUI,
+        but the selector is deliberately format-independent. Any stack that can
+        be loaded by ``load_microscopy_stack`` can enter the same quantitative
+        background-correction workflow.
+        """
         result = []
         for ed in self.editors:
             if not getattr(ed, "is_stack_editor", False):
@@ -2791,8 +2787,6 @@ class App(tk.Tk):
             # record. Process the lightweight record only to avoid duplicates.
             if getattr(ed, "source_deferred_editor", None) is not None:
                 continue
-            if os.path.splitext(getattr(ed, "path", ""))[1].lower() != ".czi":
-                continue
             roi_path = getattr(ed, "saved_roi_path", None)
             roi_rect = getattr(ed, "background_roi_rect", None)
             if not roi_path:
@@ -2800,28 +2794,28 @@ class App(tk.Tk):
                 if os.path.isfile(candidate):
                     roi_path = candidate
                     ed.saved_roi_path = candidate
-            # Loaded/transformed CZI editors can provide an in-memory ROI
+            # Loaded/transformed stack editors can provide an in-memory ROI
             # rectangle in transformed coordinates. Lazy placeholders fall back
-            # to the same-name .roi file next to the CZI.
+            # to a same-name .roi file next to the source microscopy file.
             if roi_rect is not None or (roi_path and os.path.isfile(roi_path)):
                 result.append((ed, roi_path))
         return result
 
     def _ask_fallback_z_step(self):
-        """Ask once for a fallback Z-step when CZI metadata does not expose it."""
+        """Ask once for a fallback Z-step when input metadata does not expose it."""
         from tkinter import simpledialog
         return simpledialog.askfloat(
             "Z-step required",
-            "One or more CZI files do not expose a Z-step in metadata.\n"
+            "One or more microscopy stacks do not expose a Z-step in metadata.\n"
             "Enter a fallback Z-step size in \u00b5m for Z-depth normalised sum:",
             minvalue=0.000001,
             parent=self,
         )
 
     def subtract_background_for_czi_with_rois(self):
-        """Batch-create Z-depth normalised sum projections for open CZI files.
+        """Batch-create Z-depth normalised sum projections for open stacks.
 
-        Only open CZI stack editors with an assigned same-name .roi file are
+        Open microscopy-stack editors with an assigned background ROI are
         processed. The ROI is used as the background region. Results are saved
         into a dedicated folder inside the experiment directory and opened as
         new 2-D projection images.
@@ -2832,9 +2826,9 @@ class App(tk.Tk):
         pairs = self._czi_editors_with_rois()
         if not pairs:
             messagebox.showinfo(
-                "No CZI + ROI pairs",
-                "No open CZI files have an assigned same-name .roi file.\n"
-                "Open CZI files, draw a rectangle, then use Tools -> Save ROI first."
+                "No stack + ROI pairs",
+                "No open microscopy stacks have an assigned background ROI.\n"
+                "Open stack files, draw a rectangle, then use Tools -> Save ROI first."
             )
             return
         if not _HAVE_ROIFILE or not _HAVE_SKDRAW:
@@ -2860,7 +2854,7 @@ class App(tk.Tk):
             stack = None
             proj = None
             try:
-                # Load one CZI at a time, process it, then release the stack.
+                # Load one microscopy stack at a time, process it, then release it.
                 # This keeps peak RAM usage close to one file instead of the
                 # total size of all opened CZI files.
                 self._log(f"Background subtraction: loading {base} ...")
@@ -4386,7 +4380,7 @@ def _scamp_ask_background_options(self):
     ttk.Label(p_frame, text="% (used only for Percentile)").pack(side=tk.LEFT, padx=(4, 0))
 
     note = (
-        "The same estimator will be applied to every selected CZI in this batch.\n"
+        "The same estimator will be applied to every selected microscopy stack in this batch.\n"
         "QC reports will be saved to qc_reports/ and summarized in the Open files panel."
     )
     ttk.Label(outer, text=note, foreground="#888").pack(anchor=tk.W, pady=(8, 8))
@@ -4578,9 +4572,9 @@ def _scamp_subtract_background_qc(self):
     pairs = self._czi_editors_with_rois()
     if not pairs:
         messagebox.showinfo(
-            "No CZI + ROI pairs",
-            "No open CZI files have an assigned same-name .roi file.\n"
-            "Open CZI files, draw a rectangle, then use Tools -> Save ROI first."
+            "No stack + ROI pairs",
+            "No open microscopy stacks have an assigned background ROI.\n"
+            "Open stack files, draw a rectangle, then use Tools -> Save ROI first."
         )
         return
     if not _HAVE_ROIFILE or not _HAVE_SKDRAW:
@@ -5969,9 +5963,9 @@ def _scamp_subtract_background_qc_scaled_storage(self):
     pairs = self._czi_editors_with_rois()
     if not pairs:
         messagebox.showinfo(
-            "No CZI + ROI pairs",
-            "No open CZI files have an assigned same-name .roi file.\n"
-            "Open CZI files, draw a rectangle, then use Tools -> Save ROI first."
+            "No stack + ROI pairs",
+            "No open microscopy stacks have an assigned background ROI.\n"
+            "Open stack files, draw a rectangle, then use Tools -> Save ROI first."
         )
         return
     if not _HAVE_ROIFILE or not _HAVE_SKDRAW:
@@ -6193,9 +6187,9 @@ def _scamp_subtract_background_qc_scaled_storage_roundtrip(self):
     pairs = self._czi_editors_with_rois()
     if not pairs:
         messagebox.showinfo(
-            "No CZI + ROI pairs",
-            "No open CZI files have an assigned same-name .roi file.\n"
-            "Open CZI files, draw a rectangle, then use Tools -> Save ROI first."
+            "No stack + ROI pairs",
+            "No open microscopy stacks have an assigned background ROI.\n"
+            "Open stack files, draw a rectangle, then use Tools -> Save ROI first."
         )
         return
     if not _HAVE_ROIFILE or not _HAVE_SKDRAW:
